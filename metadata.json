@@ -1,0 +1,6 @@
+{
+  "name": "Djezzy Rewards",
+  "description": "تطبيق محلي لتفعيل عروض ومكافآت جيزي مجاناً أو بعروض مميزة عبر رمز التحقق مباشرة من الهاتف.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

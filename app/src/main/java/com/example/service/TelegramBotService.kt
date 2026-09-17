@@ -22,6 +22,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /**
  * Android Foreground Service to keep the Local Telegram Bot active indefinitely in the background,
@@ -116,11 +117,20 @@ class TelegramBotService : Service() {
         val engine = LocalTelegramBotEngine.getInstance(applicationContext)
         engine.start(token, serviceScope)
 
+        serviceScope.launch {
+            engine.isWaitingForNetwork.collect { isWaiting ->
+                if (isServiceRunning) {
+                    val notifManager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                    notifManager?.notify(NOTIFICATION_ID, buildForegroundNotification(isWaiting))
+                }
+            }
+        }
+
         // START_STICKY ensures Android restarts the service if it's killed under extreme memory pressure
         return START_STICKY
     }
 
-    private fun buildForegroundNotification(): Notification {
+    private fun buildForegroundNotification(isWaitingForNetwork: Boolean = false): Notification {
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -141,13 +151,25 @@ class TelegramBotService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val title = if (isWaitingForNetwork) {
+            "🤖 بوت جيزي شغال بالخلفية (بـ 0 نت 📡)"
+        } else {
+            "🤖 بوت جيزي شغال بالخلفية 🟢"
+        }
+
+        val content = if (isWaitingForNetwork) {
+            "البوت شغال دائماً في وضع الاستعداد بـ 0 نت ولن ينطفئ، بانتظار اتصال التيليجرام."
+        } else {
+            "البوت متصل ويعمل باستمرار في الخلفية بدون انقطاع، يستقبل وينفذ التفعيلات فوراً."
+        }
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle("🤖 بوت جيزي تيليجرام شغال في الخلفية")
-            .setContentText("يستقبل الرسائل والتفعيلات محلياً عبر شبكة هاتفك")
+            .setContentTitle(title)
+            .setContentText(content)
             .setStyle(
                 NotificationCompat.BigTextStyle()
-                    .bigText("البوت متصل ويعمل في الخلفية باستمرار بدون انقطاع. يستقبل طلبات 1GB و2GB وMGM وينفذها محلياً وبدون بروكسي.")
+                    .bigText(content)
             )
             .setOngoing(true)
             .setContentIntent(pendingOpenApp)

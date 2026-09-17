@@ -6,6 +6,7 @@ import com.example.data.local.ActivationHistoryEntity
 import com.example.data.local.UserAccountDao
 import com.example.data.local.UserAccountEntity
 import com.example.data.model.MainBalanceInfo
+import com.example.data.model.MgmStatusInfo
 import com.example.data.model.Offer
 import com.example.data.model.ProxyConfig
 import com.example.data.remote.ActivationResult
@@ -94,6 +95,19 @@ class DjezzyRepository(
             return Result.failure(Exception("انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً"))
         }
         val result = apiClient.getMainBalance(current.token, current.phone)
+        if (result.isFailure && result.exceptionOrNull()?.message?.contains("انتهت صلاحية الجلسة") == true) {
+            userAccountDao.markTokenExpired(current.phone)
+        }
+        return result
+    }
+
+    suspend fun getMgmStatus(): Result<MgmStatusInfo> {
+        val current = activeAccount.firstOrNull()
+            ?: return Result.failure(Exception("يرجى تسجيل الدخول برقم جيزي أولاً"))
+        if (current.token == "EXPIRED" || current.token.isBlank()) {
+            return Result.failure(Exception("انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً"))
+        }
+        val result = apiClient.getMgmCustomerOffers(current.token, current.phone)
         if (result.isFailure && result.exceptionOrNull()?.message?.contains("انتهت صلاحية الجلسة") == true) {
             userAccountDao.markTokenExpired(current.phone)
         }

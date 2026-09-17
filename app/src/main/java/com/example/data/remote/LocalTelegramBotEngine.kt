@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.example.data.local.TelegramSessionStore
 import com.example.data.model.AvailableOffers
+import com.example.data.model.MgmStatusInfo
 import com.example.data.model.SavedTelegramPhoneAccount
 import com.example.data.model.TelegramLogItem
 import com.example.data.model.TelegramUserSession
@@ -77,6 +78,9 @@ class LocalTelegramBotEngine private constructor(
 
     private val _isRunning = MutableStateFlow(false)
     val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
+
+    private val _isWaitingForNetwork = MutableStateFlow(false)
+    val isWaitingForNetwork: StateFlow<Boolean> = _isWaitingForNetwork.asStateFlow()
 
     private val _botUsername = MutableStateFlow<String?>(null)
     val botUsername: StateFlow<String?> = _botUsername.asStateFlow()
@@ -211,75 +215,80 @@ class LocalTelegramBotEngine private constructor(
 
         currentToken = cleanToken
         _isRunning.value = true
-        addLog("تشغيل", "جاري التحقق من التوكن وتشغيل البوت في الخلفية...")
+        _isWaitingForNetwork.value = false
+        addLog("تشغيل", "🟢 تم تشغيل البوت! سيبقى شغالاً في الخلفية دائماً ولن ينطفئ حتى بـ 0 نت.")
 
         botJob = scope.launch(Dispatchers.IO) {
-            try {
-                val testRes = testToken(cleanToken)
-                if (testRes.isFailure) {
-                    val err = testRes.exceptionOrNull()?.message ?: "خطأ غير معروف"
-                    addLog("خطأ", "فشل التحقق من التوكن: $err", isError = true)
-                    _isRunning.value = false
-                    return@launch
-                }
+            var lastUpdateId = 0L
 
-                val info = testRes.getOrNull().orEmpty()
-                val uname = if (info.contains("@")) info.substringAfter("@").substringBefore(" ") else null
-                _botUsername.value = uname
-                addLog("نجاح", "🟢 البوت متصل وشغال بنجاح في الخلفية: $info", isSuccess = true)
+            while (isActive && _isRunning.value) {
+                try {
+                    // Try to fetch bot username if not yet resolved
+                    if (_botUsername.value == null) {
+                        try {
+                            val testRes = testToken(cleanToken)
+                            if (testRes.isSuccess) {
+                                val info = testRes.getOrNull().orEmpty()
+                                val uname = if (info.contains("@")) info.substringAfter("@").substringBefore(" ") else null
+                                _botUsername.value = uname
+                                addLog("نجاح", "🟢 البوت متصل وشغال: $info", isSuccess = true)
+                            }
+                        } catch (_: Exception) {}
+                    }
 
-                var lastUpdateId = 0L
-                while (isActive && _isRunning.value) {
-                    try {
-                        val updatesUrl = "$TELEGRAM_API_BASE/bot$cleanToken/getUpdates?offset=$lastUpdateId&timeout=20"
-                        val request = Request.Builder().url(updatesUrl).get().build()
+                    val updatesUrl = "$TELEGRAM_API_BASE/bot$cleanToken/getUpdates?offset=$lastUpdateId&timeout=20"
+                    val request = Request.Builder().url(updatesUrl).get().build()
 
-                        val response = telegramHttpClient.newCall(request).execute()
-                        val body = response.body?.string().orEmpty()
-                        response.close()
+                    val response = telegramHttpClient.newCall(request).execute()
+                    val body = response.body?.string().orEmpty()
+                    response.close()
 
-                        if (body.isNotBlank()) {
-                            val json = JSONObject(body)
-                            if (json.optBoolean("ok", false)) {
-                                val resultArray = json.optJSONArray("result")
-                                if (resultArray != null && resultArray.length() > 0) {
-                                    for (i in 0 until resultArray.length()) {
-                                        val updateObj = resultArray.getJSONObject(i)
-                                        val updateId = updateObj.optLong("update_id", 0L)
-                                        if (updateId >= lastUpdateId) {
-                                            lastUpdateId = updateId + 1
-                                        }
+                    if (_isWaitingForNetwork.value) {
+                        _isWaitingForNetwork.value = false
+                        addLog("اتصال", "🟢 توفرت شبكة الإنترنت: استئناف استقبال وتفعيل الرسائل فوراً.", isSuccess = true)
+                    }
 
-                                        // 1. Regular text messages
-                                        val messageObj = updateObj.optJSONObject("message")
-                                        if (messageObj != null) {
-                                            handleIncomingMessage(cleanToken, messageObj)
-                                        }
+                    if (body.isNotBlank()) {
+                        val json = JSONObject(body)
+                        if (json.optBoolean("ok", false)) {
+                            val resultArray = json.optJSONArray("result")
+                            if (resultArray != null && resultArray.length() > 0) {
+                                for (i in 0 until resultArray.length()) {
+                                    val updateObj = resultArray.getJSONObject(i)
+                                    val updateId = updateObj.optLong("update_id", 0L)
+                                    if (updateId >= lastUpdateId) {
+                                        lastUpdateId = updateId + 1
+                                    }
 
-                                        // 2. Interactive callback queries (Inline Buttons)
-                                        val callbackQueryObj = updateObj.optJSONObject("callback_query")
-                                        if (callbackQueryObj != null) {
-                                            handleCallbackQuery(cleanToken, callbackQueryObj)
-                                        }
+                                    // 1. Regular text messages
+                                    val messageObj = updateObj.optJSONObject("message")
+                                    if (messageObj != null) {
+                                        handleIncomingMessage(cleanToken, messageObj)
+                                    }
+
+                                    // 2. Interactive callback queries (Inline Buttons)
+                                    val callbackQueryObj = updateObj.optJSONObject("callback_query")
+                                    if (callbackQueryObj != null) {
+                                        handleCallbackQuery(cleanToken, callbackQueryObj)
                                     }
                                 }
                             }
                         }
-                    } catch (e: CancellationException) {
-                        break
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Polling tick exception: ${e.message}")
-                        delay(2500)
                     }
+                } catch (e: CancellationException) {
+                    break
+                } catch (e: Exception) {
+                    // Caught network failure (0 net / offline / disconnected)
+                    if (!_isWaitingForNetwork.value) {
+                        _isWaitingForNetwork.value = true
+                        addLog("استعداد", "📡 البوت شغال ومستمر (0 نت): في وضع الاستعداد الدائم ولن ينطفئ، بانتظار شبكة التيليجرام.")
+                    }
+                    delay(3500)
                 }
-            } catch (e: Exception) {
-                if (e !is CancellationException) {
-                    addLog("توقف", "توقف البوت: ${e.localizedMessage ?: e.message}", isError = true)
-                }
-            } finally {
-                _isRunning.value = false
-                _botUsername.value = null
-                addLog("توقف", "تم إيقاف تشغيل البوت.")
+            }
+
+            if (!_isRunning.value) {
+                addLog("توقف", "تم إيقاف تشغيل البوت يدوياً.")
             }
         }
     }
@@ -289,6 +298,7 @@ class LocalTelegramBotEngine private constructor(
      */
     fun stop() {
         _isRunning.value = false
+        _isWaitingForNetwork.value = false
         botJob?.cancel()
         botJob = null
         _botUsername.value = null
@@ -689,14 +699,52 @@ class LocalTelegramBotEngine private constructor(
             // MGM Send Invitation
             text.contains("إرسال دعوة") || text == "💌 إرسال دعوة MGM" || text == "/mgm" -> {
                 val acc = getActiveAccount(session)
-                val sent = acc?.mgmInvitesSent ?: 0
-                val remaining = maxOf(0, MAX_MGM_INVITES - sent)
+                if (acc == null) {
+                    sendMessage(token, chatId, "⚠️ يرجى تسجيل الدخول أولاً.", getMainMenuMarkup())
+                    return
+                }
+
+                sendMessage(token, chatId, "⏳ *جاري التحقق من أهلية رقمك للدعوات عبر سيرفر جيزي...*", getMainMenuMarkup())
+                val mgmResult = apiClient.getMgmCustomerOffers(acc.token, phone)
+                val info = mgmResult.getOrNull()
+                if (info != null) {
+                    acc.mgmInvitesSent = info.usedInvites
+                    saveOrUpdateSession(session)
+                }
+
+                if (info != null && info.isAllConsumed) {
+                    val textExhausted = "⚠️ *عذراً، لا يمكنك إرسال دعوات!* ⚠️\n" +
+                            "───────────────────\n" +
+                            "📱 *الرقم:* `$displayPhone`\n" +
+                            "❌ لقد قمت باستهلاك وتفعيل جميع دعوات الرعاية الـ ${info.totalAllowed} بالكامل من قبل!\n" +
+                            "🎁 *الدعوات المتبقية:* 0 دعوات متاحة.\n\n" +
+                            "💡 *ملاحظة:* إذا كان لديك رقم جيزي آخر لم يستنفذ دعواته، يمكنك التبديل إليه من قائمة '📱 إدارة أرقامي' وإرسال الدعوات منه."
+
+                    val inlineKb = JSONArray().apply {
+                        put(JSONArray().apply {
+                            put(JSONObject().apply {
+                                put("text", "📱 إدارة أرقامي")
+                                put("callback_data", "act_numbers")
+                            })
+                            put(JSONObject().apply {
+                                put("text", "🎁 تفعيل 1 جيجا")
+                                put("callback_data", "act_1gb")
+                            })
+                        })
+                    }
+                    val markup = JSONObject().apply { put("inline_keyboard", inlineKb) }
+                    sendMessage(token, chatId, textExhausted, getMainMenuMarkup(), markup)
+                    return
+                }
+
+                val total = info?.totalAllowed ?: MAX_MGM_INVITES
+                val remaining = info?.remainingInvites ?: maxOf(0, total - (acc.mgmInvitesSent))
+                val sent = info?.usedInvites ?: acc.mgmInvitesSent
 
                 val prompt = "💌 *إرسال دعوة رعاية (MGM)*\n" +
                         "───────────────────\n" +
                         "🎁 أرسل دعوة رسمية من رقمك إلى صديقك ليستفيد من 1GB إنترنت مجاناً، وتكسب أنت أيضاً 1GB!\n\n" +
-                        "📊 *حالة رصيد دعواتك:* $sent / $MAX_MGM_INVITES مستهلكة\n" +
-                        "🎁 *المتبقي لك:* $remaining دعوات متاحة\n\n" +
+                        "📊 *حالة رصيد دعواتك الحقيقي:* متبقي *$remaining* من *$total* دعوات ($sent مستهلكة)\n\n" +
                         "📱 *اكتب رقم هاتف جيزي الخاص بالشخص المستلم:*\n" +
                         "مثال: `0773527865` أو `0770123456`\n\n" +
                         "*(أو أرسل 'رجوع' للعودة)*"
@@ -841,46 +889,84 @@ class LocalTelegramBotEngine private constructor(
     }
 
     /**
-     * Show MGM Referral Tracker Card.
+     * Show MGM Referral Tracker Card with live data from official Djezzy APIM endpoint.
      */
     private suspend fun showMgmStats(token: String, chatId: Long, session: TelegramUserSession) {
         val phone = session.activePhone
         val displayPhone = apiClient.formatDisplayPhone(phone)
         val acc = getActiveAccount(session)
-        val sent = acc?.mgmInvitesSent ?: 0
-        val remaining = maxOf(0, MAX_MGM_INVITES - sent)
-        val earnedGb = sent
-
-        val text = "📊 *إحصائيات دعوات الرعاية (MGM)*\n" +
-                "───────────────────\n" +
-                "📱 *الرقم الحالي:* `$displayPhone`\n" +
-                "💌 *الدعوات المرسلة:* *$sent* من *$MAX_MGM_INVITES* دعوات\n" +
-                "🎁 *الدعوات المتبقية:* *$remaining* دعوات متاحة\n" +
-                "⚡ *إجمالي الرصيد المكتسب:* *$earnedGb جيجا* مجاناً\n\n" +
-                "💡 *كيف يعمل العرض؟*\n" +
-                "في كل مرة يفتح صديقك الدعوة ويسجل دخوله، يربح هو 1 جيجا وتربح أنت 1 جيجا إضافية!"
-
-        val inlineKeyboard = JSONArray().apply {
-            put(JSONArray().apply {
-                put(JSONObject().apply {
-                    put("text", "💌 إرسال دعوة جديدة الآن")
-                    put("callback_data", "act_mgm")
-                })
-            })
-            put(JSONArray().apply {
-                put(JSONObject().apply {
-                    put("text", "🎁 تفعيل 1 جيجا")
-                    put("callback_data", "act_1gb")
-                })
-                put(JSONObject().apply {
-                    put("text", "💰 فحص الرصيد")
-                    put("callback_data", "act_balance")
-                })
-            })
+        if (acc == null) {
+            sendMessage(token, chatId, "⚠️ يرجى تسجيل الدخول أولاً.", getMainMenuMarkup())
+            return
         }
 
-        val markup = JSONObject().apply { put("inline_keyboard", inlineKeyboard) }
-        sendMessage(token, chatId, text, getMainMenuMarkup(), markup)
+        sendMessage(token, chatId, "⏳ *جاري فحص رصيد دعوات MGM عبر سيرفر جيزي الرسمي...*", getMainMenuMarkup())
+
+        val mgmResult = apiClient.getMgmCustomerOffers(acc.token, phone)
+        if (mgmResult.isSuccess) {
+            val info = mgmResult.getOrThrow()
+            acc.mgmInvitesSent = info.usedInvites
+            saveOrUpdateSession(session)
+
+            val statusTitle = if (info.isAllConsumed) {
+                "⚠️ *حالة الحساب:* تم تفعيل واستهلاك جميع الدعوات الـ ${info.totalAllowed} بالكامل من قبل! (0 دعوة متبقية)"
+            } else if (info.usedInvites == 0) {
+                "✅ *حالة الحساب:* مؤهل بالكامل، لم تستهلك أي دعوة بعد!"
+            } else {
+                "✅ *حالة الحساب:* مؤهل، متبقي لك *${info.remainingInvites}* دعوة من أصل *${info.totalAllowed}*"
+            }
+
+            val text = "📊 *فحص دعوات الرعاية (MGM) الرسمي*\n" +
+                    "───────────────────\n" +
+                    "📱 *الرقم الحالي:* `$displayPhone`\n" +
+                    "$statusTitle\n\n" +
+                    "🎁 *الدعوات المتبقية:* *${info.remainingInvites}* من *${info.totalAllowed}* دعوات متاحة\n" +
+                    "💌 *الدعوات المستهلكة:* *${info.usedInvites}* دعوات سابقة\n" +
+                    "⚡ *إجمالي الرصيد المكتسب:* *${info.usedInvites} جيجا* مجاناً\n\n" +
+                    "📝 *تقرير السيرفر الرسمي:*\n${info.statusSummary}\n\n" +
+                    "💡 *كيف يعمل العرض؟*\n" +
+                    "في كل مرة يفتح صديقك الدعوة ويسجل دخوله، يربح هو 1 جيجا وتربح أنت 1 جيجا إضافية!"
+
+            val inlineKeyboard = JSONArray().apply {
+                if (info.remainingInvites > 0) {
+                    put(JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("text", "💌 إرسال دعوة جديدة الآن")
+                            put("callback_data", "act_mgm")
+                        })
+                    })
+                }
+                put(JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("text", "🎁 تفعيل 1 جيجا")
+                        put("callback_data", "act_1gb")
+                    })
+                    put(JSONObject().apply {
+                        put("text", "💰 فحص الرصيد")
+                        put("callback_data", "act_balance")
+                    })
+                })
+                if (session.savedAccounts.size > 1) {
+                    put(JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("text", "📱 إدارة / تبديل الأرقام")
+                            put("callback_data", "act_numbers")
+                        })
+                    })
+                }
+            }
+
+            val markup = JSONObject().apply { put("inline_keyboard", inlineKeyboard) }
+            sendMessage(token, chatId, text, getMainMenuMarkup(), markup)
+        } else {
+            val error = mgmResult.exceptionOrNull()?.message.orEmpty()
+            if (error.contains("انتهت صلاحية الجلسة")) {
+                promptReLogin(token, chatId, session)
+            } else {
+                val friendlyMsg = sanitizeErrorMessage(error)
+                sendMessage(token, chatId, "⚠️ *تعذر فحص دعوات MGM:*\n$friendlyMsg", getMainMenuMarkup())
+            }
+        }
     }
 
     /**

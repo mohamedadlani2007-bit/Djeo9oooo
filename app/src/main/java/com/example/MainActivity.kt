@@ -107,6 +107,7 @@ fun DjezzyApp(viewModel: MainViewModel) {
                     onOpenProxySettings = { viewModel.showProxyDialog(true) },
                     onOpenHistory = { viewModel.showHistoryDialog(true) },
                     isTelegramBotRunning = uiState.isTelegramBotRunning,
+                    isTelegramBotWaitingForNetwork = uiState.isTelegramBotWaitingForNetwork,
                     telegramBotUsername = uiState.telegramBotUsername,
                     onOpenTelegramBot = { viewModel.showTelegramBotDialog(true) },
                     onOpenMgmInvite = { viewModel.showMgmInviteDialog(true) }
@@ -155,6 +156,7 @@ fun DjezzyApp(viewModel: MainViewModel) {
                 TelegramBotDialog(
                     initialToken = uiState.telegramBotToken,
                     isRunning = uiState.isTelegramBotRunning,
+                    isWaitingForNetwork = uiState.isTelegramBotWaitingForNetwork,
                     botUsername = uiState.telegramBotUsername,
                     messagesCount = uiState.telegramMessagesCount,
                     logs = uiState.telegramLogs,
@@ -169,6 +171,9 @@ fun DjezzyApp(viewModel: MainViewModel) {
             if (uiState.showMgmInviteDialog && activeAccount != null) {
                 SendMgmDialog(
                     senderPhone = activeAccount!!.displayPhone,
+                    mgmStatus = uiState.mgmStatus,
+                    isFetchingStatus = uiState.isFetchingMgmStatus,
+                    onRefreshStatus = { viewModel.refreshMgmStatus() },
                     onDismiss = { viewModel.showMgmInviteDialog(false) },
                     onSendInvite = { receiver -> viewModel.sendMgmInvitation(receiver) }
                 )

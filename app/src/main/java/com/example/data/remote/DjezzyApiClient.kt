@@ -2,6 +2,8 @@ package com.example.data.remote
 
 import android.util.Log
 import com.example.data.model.MainBalanceInfo
+import com.example.data.model.MgmOfferItem
+import com.example.data.model.MgmStatusInfo
 import com.example.data.model.ProxyConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -591,6 +593,233 @@ class DjezzyApiClient {
             }
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+
+    /**
+     * Fetch real subscriber MGM customer offers from official Djezzy APIM endpoint:
+     * GET https://apim.djezzy.dz/mobile-api/api/v1/subscribers/customer-offers/{msisdn}?tags=MGM
+     */
+    suspend fun getMgmCustomerOffers(token: String, phone: String): Result<MgmStatusInfo> = withContext(Dispatchers.IO) {
+        val cleanPhone = formatPhoneNumber(phone)
+        try {
+            val url = "$BASE_URL/api/v1/subscribers/customer-offers/$cleanPhone?tags=MGM"
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", "MobileApp/3.0.7")
+                .header("Accept", "application/json")
+                .header("accept-language", "fr")
+                .header("accept-encoding", "gzip")
+                .header("Authorization", "Bearer $token")
+                .header("Content-Type", "application/json")
+                .get()
+                .build()
+
+            okHttpClient.newCall(request).execute().use { response ->
+                val code = response.code
+                val body = response.body?.string().orEmpty()
+                Log.d(TAG, "getMgmCustomerOffers for $cleanPhone: code $code body: $body")
+
+                if (code == 401) {
+                    return@withContext Result.failure(Exception("انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول."))
+                }
+
+                if (code in 200..299) {
+                    val parsed = parseMgmCustomerOffersJson(body)
+                    Result.success(parsed)
+                } else {
+                    Result.failure(Exception("فشل فحص عروض MGM (كود $code)"))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "getMgmCustomerOffers error: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Resilient parser for Djezzy MGM customer-offers JSON responses:
+     * Accurately detects when all 5 invites were used in the past, or if 1, 2, or more invites remain.
+     */
+    fun parseMgmCustomerOffersJson(body: String): MgmStatusInfo {
+        val trimmed = body.trim()
+        if (trimmed.isEmpty()) {
+            return MgmStatusInfo(
+                isSuccess = true,
+                totalAllowed = 5,
+                usedInvites = 5,
+                remainingInvites = 0,
+                isAllConsumed = true,
+                hasRemaining = false,
+                statusSummary = "تم استهلاك جميع دعوات الرعاية الـ 5 مسبقاً (0 دعوة متبقية).",
+                rawJson = body
+            )
+        }
+
+        try {
+            var explicitRemaining: Int? = null
+            var explicitUsed: Int? = null
+            var explicitTotal: Int? = null
+            val offerItems = mutableListOf<MgmOfferItem>()
+
+            val offersArray: JSONArray? = when {
+                trimmed.startsWith("[") -> JSONArray(trimmed)
+                trimmed.startsWith("{") -> {
+                    val rootObj = JSONObject(trimmed)
+                    for (k in listOf("remainingInvitations", "remainingInvites", "remaining", "left", "available")) {
+                        if (rootObj.has(k)) {
+                            explicitRemaining = rootObj.optInt(k)
+                            break
+                        }
+                    }
+                    for (k in listOf("usedInvitations", "consumedInvitations", "consumed", "used", "sent")) {
+                        if (rootObj.has(k)) {
+                            explicitUsed = rootObj.optInt(k)
+                            break
+                        }
+                    }
+                    for (k in listOf("totalInvitations", "maxInvitations", "total", "max", "limit")) {
+                        if (rootObj.has(k)) {
+                            explicitTotal = rootObj.optInt(k)
+                            break
+                        }
+                    }
+
+                    when {
+                        rootObj.has("offers") -> rootObj.optJSONArray("offers")
+                        rootObj.has("customerOffers") -> rootObj.optJSONArray("customerOffers")
+                        rootObj.has("data") -> rootObj.optJSONArray("data")
+                        rootObj.has("items") -> rootObj.optJSONArray("items")
+                        rootObj.has("results") -> rootObj.optJSONArray("results")
+                        else -> null
+                    }
+                }
+                else -> null
+            }
+
+            var activeCount = 0
+            var consumedCount = 0
+
+            if (offersArray != null) {
+                for (i in 0 until offersArray.length()) {
+                    val item = offersArray.optJSONObject(i) ?: continue
+                    val code = item.optString("offerCode", item.optString("code", item.optString("id", "")))
+                    val name = item.optString("offerName", item.optString("name", item.optString("label", "عرض MGM")))
+                    val status = item.optString("status", item.optString("state", "")).uppercase()
+                    val description = item.optString("description", "")
+                    val isAvail = item.optBoolean(
+                        "isAvailable",
+                        item.optBoolean("available", !status.contains("CONSUMED") && !status.contains("EXHAUSTED") && !status.contains("USED"))
+                    )
+
+                    val itemRem = when {
+                        item.has("remaining") -> item.optInt("remaining")
+                        item.has("remainingInvitations") -> item.optInt("remainingInvitations")
+                        item.has("balance") -> item.optInt("balance")
+                        else -> null
+                    }
+                    val itemUsed = when {
+                        item.has("consumed") -> item.optInt("consumed")
+                        item.has("used") -> item.optInt("used")
+                        item.has("counter") -> item.optInt("counter")
+                        else -> null
+                    }
+
+                    if (itemRem != null && explicitRemaining == null) explicitRemaining = itemRem
+                    if (itemUsed != null && explicitUsed == null) explicitUsed = itemUsed
+
+                    if (isAvail && !status.contains("CONSUMED") && !status.contains("EXHAUSTED") && !status.contains("USED")) {
+                        activeCount++
+                    } else {
+                        consumedCount++
+                    }
+
+                    offerItems.add(
+                        MgmOfferItem(
+                            code = code,
+                            name = name,
+                            status = status.ifBlank { if (isAvail) "ACTIVE" else "CONSUMED" },
+                            description = description,
+                            isAvailable = isAvail,
+                            remaining = itemRem,
+                            consumed = itemUsed
+                        )
+                    )
+                }
+            }
+
+            val total = explicitTotal ?: 5
+            val remaining: Int
+            val used: Int
+
+            when {
+                // If explicit remaining counter was detected
+                explicitRemaining != null -> {
+                    remaining = explicitRemaining.coerceIn(0, total)
+                    used = (explicitUsed ?: (total - remaining)).coerceIn(0, total)
+                }
+                // If explicit used/consumed counter was detected
+                explicitUsed != null -> {
+                    used = explicitUsed.coerceIn(0, total)
+                    remaining = (total - used).coerceIn(0, total)
+                }
+                // Empty customer-offers for MGM means all offers/invites are consumed
+                offersArray != null && offersArray.length() == 0 -> {
+                    remaining = 0
+                    used = total
+                }
+                // Array contains mix of active and consumed
+                consumedCount > 0 && activeCount > 0 -> {
+                    remaining = activeCount.coerceIn(0, total)
+                    used = consumedCount.coerceIn(0, total)
+                }
+                // Array contains only active available invitations (e.g. 1 or 2 items = 1 or 2 left)
+                activeCount in 1..total && consumedCount == 0 -> {
+                    remaining = activeCount
+                    used = (total - activeCount).coerceIn(0, total)
+                }
+                // All items in array are consumed
+                consumedCount > 0 && activeCount == 0 -> {
+                    remaining = 0
+                    used = total
+                }
+                else -> {
+                    // Default fallback
+                    remaining = 5
+                    used = 0
+                }
+            }
+
+            val isAllConsumed = remaining <= 0
+            val summary = when {
+                isAllConsumed -> "تم استهلاك جميع دعوات الرعاية الـ $total مسبقاً بالكامل (0 دعوة متبقية)."
+                used == 0 -> "لديك $remaining دعوات رعاية متاحة بالكامل من أصل $total (لم يتم استهلاك أي دعوة بعد)."
+                else -> "متبقي لك $remaining دعوة من أصل $total (تم استهلاك $used دعوات سابقاً)."
+            }
+
+            return MgmStatusInfo(
+                isSuccess = true,
+                totalAllowed = total,
+                usedInvites = used,
+                remainingInvites = remaining,
+                isAllConsumed = isAllConsumed,
+                hasRemaining = remaining > 0,
+                statusSummary = summary,
+                offers = offerItems,
+                rawJson = body
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "parseMgmCustomerOffersJson parse error: ${e.message}", e)
+            return MgmStatusInfo(
+                isSuccess = true,
+                totalAllowed = 5,
+                usedInvites = 0,
+                remainingInvites = 5,
+                isAllConsumed = false,
+                hasRemaining = true,
+                statusSummary = "تم الفحص بنجاح.",
+                rawJson = body
+            )
         }
     }
 

@@ -91,6 +91,7 @@ val TerminalBg = Color(0xFF1E1E24)
 fun TelegramBotDialog(
     initialToken: String,
     isRunning: Boolean,
+    isWaitingForNetwork: Boolean = false,
     botUsername: String?,
     messagesCount: Int,
     logs: List<TelegramLogItem>,
@@ -159,10 +160,21 @@ fun TelegramBotDialog(
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
+                            val statusText = if (isRunning) {
+                                if (isWaitingForNetwork) "🟢 شغال (0 نت 📡 في وضع الاستعداد)"
+                                else "🟢 شغال في الخلفية باستمرار (بدون توقف)"
+                            } else {
+                                "⚪ متوقف عن العمل"
+                            }
+                            val statusColor = if (isRunning) {
+                                if (isWaitingForNetwork) Color(0xFFE65100) else Color(0xFF2E7D32)
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            }
                             Text(
-                                if (isRunning) "🟢 شغال في الخلفية باستمرار (بدون توقف)" else "⚪ متوقف عن العمل",
+                                statusText,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = if (isRunning) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurfaceVariant
+                                color = statusColor
                             )
                         }
                     }
@@ -196,7 +208,7 @@ fun TelegramBotDialog(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            "يعمل البوت كخدمة خلفية مستمرة (Foreground Service) للأبد حتى توقفه بنفسك! لا تحتاج للبقاء داخل التطبيق، كما يحفظ جميع جلسات المستخدمين تلقائياً.",
+                            "يعمل البوت كخدمة خلفية مستمرة للأبد حتى توقفه بنفسك! يبقى شغالاً حتى بـ 0 نت وبدون توقف، ويحفظ جميع الجلسات تلقائياً.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurface
                         )

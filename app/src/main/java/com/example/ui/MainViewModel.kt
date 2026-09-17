@@ -8,6 +8,7 @@ import com.example.data.local.TelegramBotPreferences
 import com.example.data.local.UserAccountEntity
 import com.example.data.model.AvailableOffers
 import com.example.data.model.MainBalanceInfo
+import com.example.data.model.MgmStatusInfo
 import com.example.data.model.Offer
 import com.example.data.model.ProxyConfig
 import com.example.data.model.TelegramLogItem
@@ -47,11 +48,14 @@ data class UiState(
     // Telegram Bot state
     val telegramBotToken: String = "",
     val isTelegramBotRunning: Boolean = false,
+    val isTelegramBotWaitingForNetwork: Boolean = false,
     val telegramBotUsername: String? = null,
     val telegramMessagesCount: Int = 0,
     val telegramLogs: List<TelegramLogItem> = emptyList(),
     // MGM Invite state
-    val isSendingMgmInvite: Boolean = false
+    val isSendingMgmInvite: Boolean = false,
+    val mgmStatus: MgmStatusInfo? = null,
+    val isFetchingMgmStatus: Boolean = false
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -94,6 +98,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         viewModelScope.launch {
+            repository.botEngine.isWaitingForNetwork.collect { isWaiting ->
+                _uiState.update { it.copy(isTelegramBotWaitingForNetwork = isWaiting) }
+            }
+        }
+        viewModelScope.launch {
             repository.botEngine.botUsername.collect { username ->
                 _uiState.update { it.copy(telegramBotUsername = username) }
             }
@@ -107,6 +116,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             repository.botEngine.messagesCount.collect { count ->
                 _uiState.update { it.copy(telegramMessagesCount = count) }
             }
+        }
+
+        // Auto-start bot service if previously enabled by user
+        val savedToken = botPrefs.getBotToken()
+        if (botPrefs.isAutoStart() && savedToken.isNotBlank()) {
+            TelegramBotService.start(getApplication(), savedToken)
         }
     }
 
@@ -262,6 +277,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun showMgmInviteDialog(show: Boolean) {
         _uiState.update { it.copy(showMgmInviteDialog = show) }
+        if (show) {
+            refreshMgmStatus()
+        }
+    }
+
+    fun refreshMgmStatus() {
+        val current = activeAccount.value ?: return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isFetchingMgmStatus = true) }
+            val result = repository.getMgmStatus()
+            _uiState.update {
+                it.copy(
+                    isFetchingMgmStatus = false,
+                    mgmStatus = result.getOrNull()
+                )
+            }
+        }
     }
 
     fun startTelegramBot(token: String) {
@@ -271,14 +303,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         botPrefs.saveBotToken(cleanToken)
+        botPrefs.setAutoStart(true)
         _uiState.update { it.copy(telegramBotToken = cleanToken) }
         TelegramBotService.start(getApplication(), cleanToken)
-        _uiState.update { it.copy(snackbarMessage = "تم تشغيل البوت في الخلفية بنجاح!") }
+        _uiState.update { it.copy(snackbarMessage = "تم تشغيل البوت! سيبقى شغالاً باستمرار حتى بـ 0 نت.") }
     }
 
     fun stopTelegramBot() {
+        botPrefs.setAutoStart(false)
         TelegramBotService.stop(getApplication())
-        _uiState.update { it.copy(snackbarMessage = "تم إيقاف تشغيل البوت") }
+        _uiState.update { it.copy(snackbarMessage = "تم إيقاف تشغيل البوت يدوياً") }
     }
 
     fun clearTelegramLogs() {
@@ -321,6 +355,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     activationResult = result
                 )
             }
+            refreshMgmStatus()
         }
     }
 

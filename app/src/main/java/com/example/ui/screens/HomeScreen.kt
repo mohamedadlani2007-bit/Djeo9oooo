@@ -111,6 +111,7 @@ fun HomeScreen(
     onOpenProxySettings: () -> Unit,
     onOpenHistory: () -> Unit,
     isTelegramBotRunning: Boolean = false,
+    isTelegramBotWaitingForNetwork: Boolean = false,
     telegramBotUsername: String? = null,
     onOpenTelegramBot: () -> Unit = {},
     onOpenMgmInvite: () -> Unit = {}
@@ -243,6 +244,7 @@ fun HomeScreen(
             item {
                 TelegramBotQuickCard(
                     isRunning = isTelegramBotRunning,
+                    isWaitingForNetwork = isTelegramBotWaitingForNetwork,
                     botUsername = telegramBotUsername,
                     onClick = onOpenTelegramBot,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
@@ -1015,6 +1017,7 @@ private fun OfferItemCard(
 @Composable
 fun TelegramBotQuickCard(
     isRunning: Boolean,
+    isWaitingForNetwork: Boolean = false,
     botUsername: String?,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -1065,19 +1068,25 @@ fun TelegramBotQuickCard(
                                 modifier = Modifier
                                     .size(8.dp)
                                     .clip(CircleShape)
-                                    .background(Color(0xFF2E7D32))
+                                    .background(if (isWaitingForNetwork) Color(0xFFE65100) else Color(0xFF2E7D32))
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                         }
                         Text(
-                            text = if (isRunning) "بوت تيليجرام شغال في الخلفية (@${botUsername ?: "DjezzyBot"})" else "بوت تيليجرام المحلي",
+                            text = if (isRunning) {
+                                if (isWaitingForNetwork) "بوت تيليجرام شغال (بـ 0 نت 📡)"
+                                else "بوت تيليجرام شغال في الخلفية (@${botUsername ?: "DjezzyBot"})"
+                            } else "بوت تيليجرام المحلي",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Bold,
                             color = if (isRunning) Color(0xFF0088CC) else MaterialTheme.colorScheme.onSurface
                         )
                     }
                     Text(
-                        text = if (isRunning) "شغال دائماً في الخلفية مع حفظ الجلسات وتفعيل فوري محلياً" else "شغل بوت محلي يعمل بالخلفية للأبد ويحفظ الجلسات بدون بروكسي",
+                        text = if (isRunning) {
+                            if (isWaitingForNetwork) "شغال ومستمر في وضع الاستعداد، وسيتصل فور توفر الإنترنت"
+                            else "شغال دائماً في الخلفية مع حفظ الجلسات وتفعيل فوري محلياً"
+                        } else "شغل بوت محلي يعمل بالخلفية للأبد ويحفظ الجلسات بدون بروكسي",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontSize = 11.sp

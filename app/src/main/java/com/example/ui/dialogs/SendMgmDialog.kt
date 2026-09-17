@@ -1,5 +1,6 @@
 package com.example.ui.dialogs
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,13 +14,17 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MarkEmailRead
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -34,21 +39,27 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
+import com.example.data.model.MgmStatusInfo
 import com.example.ui.theme.DjezzyRed
 
 @Composable
 fun SendMgmDialog(
     senderPhone: String,
+    mgmStatus: MgmStatusInfo? = null,
+    isFetchingStatus: Boolean = false,
+    onRefreshStatus: () -> Unit = {},
     onDismiss: () -> Unit,
     onSendInvite: (receiverPhone: String) -> Unit
 ) {
     var receiverInput by remember { mutableStateOf("") }
     val isPhoneValid = receiverInput.filter { it.isDigit() }.length in 9..12
+    val canSend = isPhoneValid && (mgmStatus?.isAllConsumed != true)
 
     Dialog(onDismissRequest = onDismiss) {
         Card(
@@ -105,10 +116,114 @@ fun SendMgmDialog(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Live MGM Status Banner
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = when {
+                            mgmStatus?.isAllConsumed == true -> MaterialTheme.colorScheme.errorContainer
+                            mgmStatus != null && mgmStatus.remainingInvites > 0 -> Color(0xFFE8F5E9)
+                            else -> MaterialTheme.colorScheme.surfaceVariant
+                        }
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (isFetchingStatus) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(20.dp),
+                                    strokeWidth = 2.dp,
+                                    color = DjezzyRed
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    "جاري فحص رصيد الدعوات في سيرفر جيزي...",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            } else if (mgmStatus != null) {
+                                if (mgmStatus.isAllConsumed) {
+                                    Icon(
+                                        Icons.Default.Warning,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            "تم استهلاك جميع الدعوات الـ ${mgmStatus.totalAllowed} مسبقاً!",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                        Text(
+                                            "0 دعوة متبقية لهذا الرقم.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                    }
+                                } else {
+                                    Icon(
+                                        Icons.Default.CheckCircle,
+                                        contentDescription = null,
+                                        tint = Color(0xFF2E7D32),
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            "متبقي: ${mgmStatus.remainingInvites} من ${mgmStatus.totalAllowed} دعوات متاحة",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFF1B5E20)
+                                        )
+                                        Text(
+                                            "تم استهلاك ${mgmStatus.usedInvites} دعوات سابقة.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = Color(0xFF2E7D32)
+                                        )
+                                    }
+                                }
+                            } else {
+                                Text(
+                                    "فحص رصيد دعوات الرعاية المتاح",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+
+                        IconButton(
+                            onClick = onRefreshStatus,
+                            enabled = !isFetchingStatus,
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Refresh,
+                                contentDescription = "تحديث الفحص",
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
 
                 Text(
-                    "أدخل رقم هاتف صديقك (شريحة جيزي) لإرسال دعوة الرعاية والحصول على مكافآت MGM:",
+                    "أدخل رقم هاتف صديقك (شريحة جيزي) لإرسال دعوة الرعاية والحصول على 1 جيجا مجاناً:",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurface
                 )
@@ -121,6 +236,7 @@ fun SendMgmDialog(
                     label = { Text("رقم هاتف المستلم (جيزي)") },
                     placeholder = { Text("0773527865") },
                     singleLine = true,
+                    enabled = mgmStatus?.isAllConsumed != true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                     modifier = Modifier
                         .fillMaxWidth()
@@ -144,14 +260,14 @@ fun SendMgmDialog(
 
                     Button(
                         onClick = {
-                            if (isPhoneValid) {
+                            if (canSend) {
                                 onSendInvite(receiverInput)
                             }
                         },
                         modifier = Modifier
                             .weight(1.5f)
                             .testTag("submit_send_invite_btn"),
-                        enabled = isPhoneValid,
+                        enabled = canSend,
                         shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = DjezzyRed)
                     ) {

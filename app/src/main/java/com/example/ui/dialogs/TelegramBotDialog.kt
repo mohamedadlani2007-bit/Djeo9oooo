@@ -160,7 +160,7 @@ fun TelegramBotDialog(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                if (isRunning) "🟢 قيد التشغيل محلياً (بدون بروكسي)" else "⚪ متوقف عن العمل",
+                                if (isRunning) "🟢 شغال في الخلفية باستمرار (بدون توقف)" else "⚪ متوقف عن العمل",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = if (isRunning) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -196,7 +196,7 @@ fun TelegramBotDialog(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            "يعمل البوت مباشرة من هاتفك عبر شبكة جيزي. لا حاجة لأي بروكسي أو سيرفر VPS خارجي!",
+                            "يعمل البوت كخدمة خلفية مستمرة (Foreground Service) للأبد حتى توقفه بنفسك! لا تحتاج للبقاء داخل التطبيق، كما يحفظ جميع جلسات المستخدمين تلقائياً.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurface
                         )

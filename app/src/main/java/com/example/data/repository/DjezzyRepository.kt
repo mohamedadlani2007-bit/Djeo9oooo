@@ -1,5 +1,6 @@
 package com.example.data.repository
 
+import android.content.Context
 import com.example.data.local.ActivationHistoryDao
 import com.example.data.local.ActivationHistoryEntity
 import com.example.data.local.UserAccountDao
@@ -16,10 +17,11 @@ import kotlinx.coroutines.flow.firstOrNull
 class DjezzyRepository(
     private val userAccountDao: UserAccountDao,
     private val activationHistoryDao: ActivationHistoryDao,
+    context: Context,
     private val apiClient: DjezzyApiClient = DjezzyApiClient()
 ) {
 
-    val botEngine: LocalTelegramBotEngine = LocalTelegramBotEngine(apiClient)
+    val botEngine: LocalTelegramBotEngine = LocalTelegramBotEngine.getInstance(context, apiClient)
 
     companion object {
         const val COOLDOWN_1GB_MS = 24 * 60 * 60 * 1000L // 24 hours

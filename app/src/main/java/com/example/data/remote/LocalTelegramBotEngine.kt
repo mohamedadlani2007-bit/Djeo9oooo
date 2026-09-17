@@ -1,6 +1,8 @@
 package com.example.data.remote
 
+import android.content.Context
 import android.util.Log
+import com.example.data.local.TelegramSessionStore
 import com.example.data.model.TelegramLogItem
 import com.example.data.model.TelegramUserSession
 import com.example.data.model.TelegramUserState
@@ -22,19 +24,44 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
-class LocalTelegramBotEngine(
+/**
+ * Local Telegram Bot Engine running directly on the user's Android phone.
+ * - Works directly over the local network without proxy.
+ * - Persists sessions across app restarts using TelegramSessionStore.
+ * - Supports ReplyKeyboards & InlineKeyboards with callback queries.
+ * - Formatted with clear Algerian/Arabic responses and informative status cards.
+ */
+class LocalTelegramBotEngine private constructor(
+    context: Context,
     private val apiClient: DjezzyApiClient
 ) {
     companion object {
         private const val TAG = "TelegramBotEngine"
         private const val TELEGRAM_API_BASE = "https://api.telegram.org"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        @Volatile
+        private var instance: LocalTelegramBotEngine? = null
+
+        fun getInstance(context: Context, apiClient: DjezzyApiClient = DjezzyApiClient()): LocalTelegramBotEngine {
+            return instance ?: synchronized(this) {
+                instance ?: LocalTelegramBotEngine(
+                    context = context.applicationContext,
+                    apiClient = apiClient
+                ).also { instance = it }
+            }
+        }
     }
 
-    // Direct HTTP client for Telegram API (never uses SOCKS/HTTP proxy intended for Djezzy)
+    private val sessionStore = TelegramSessionStore(context)
+
+    // Direct HTTP client for Telegram API
     private val telegramHttpClient = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
@@ -57,7 +84,25 @@ class LocalTelegramBotEngine(
     private val _messagesCount = MutableStateFlow(0)
     val messagesCount: StateFlow<Int> = _messagesCount.asStateFlow()
 
+    // In-memory sessions synchronized with persistent disk storage
     private val sessions = ConcurrentHashMap<Long, TelegramUserSession>()
+
+    init {
+        // Load saved sessions from permanent disk storage
+        try {
+            val loaded = sessionStore.getAllSessions()
+            sessions.putAll(loaded)
+            if (loaded.isNotEmpty()) {
+                addLog("جلسات", "تم استرجاع ${loaded.size} جلسة مستخدم محفوظة من الذاكرة المحلية.")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error loading saved sessions: ${e.message}")
+        }
+    }
+
+    private fun getFormattedTime(): String {
+        return SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+    }
 
     fun addLog(tag: String, message: String, isError: Boolean = false, isSuccess: Boolean = false) {
         val item = TelegramLogItem(
@@ -67,7 +112,7 @@ class LocalTelegramBotEngine(
             isSuccess = isSuccess
         )
         _botLogs.update { current ->
-            (listOf(item) + current).take(150)
+            (listOf(item) + current).take(200)
         }
         if (isError) {
             Log.e(TAG, "[$tag] $message")
@@ -78,6 +123,16 @@ class LocalTelegramBotEngine(
 
     fun clearLogs() {
         _botLogs.value = emptyList()
+    }
+
+    private fun saveOrUpdateSession(session: TelegramUserSession) {
+        sessions[session.chatId] = session
+        sessionStore.saveSession(session)
+    }
+
+    private fun deleteSession(chatId: Long) {
+        sessions.remove(chatId)
+        sessionStore.removeSession(chatId)
     }
 
     /**
@@ -126,11 +181,10 @@ class LocalTelegramBotEngine(
 
         currentToken = cleanToken
         _isRunning.value = true
-        addLog("تشغيل", "جاري التحقق من التوكن وبدء الخدمة المحلية...")
+        addLog("تشغيل", "جاري التحقق من التوكن وتشغيل البوت في الخلفية...")
 
         botJob = scope.launch(Dispatchers.IO) {
             try {
-                // Verify Token First
                 val testRes = testToken(cleanToken)
                 if (testRes.isFailure) {
                     val err = testRes.exceptionOrNull()?.message ?: "خطأ غير معروف"
@@ -142,10 +196,9 @@ class LocalTelegramBotEngine(
                 val info = testRes.getOrNull().orEmpty()
                 val uname = if (info.contains("@")) info.substringAfter("@").substringBefore(" ") else null
                 _botUsername.value = uname
-                addLog("نجاح", "🟢 البوت متصل بنجاح: $info", isSuccess = true)
-                addLog("معلومات", "يعمل البوت محلياً على هذا الجهاز عبر شبكة جيزي مباشرة وبدون بروكسي.")
+                addLog("نجاح", "🟢 البوت متصل وشغال بنجاح في الخلفية: $info", isSuccess = true)
+                addLog("معلومات", "يعمل محلياً بالكامل ويحفظ جلسات المستخدمين بدون انقطاع.")
 
-                // Polling Loop
                 var lastUpdateId = 0L
                 while (isActive && _isRunning.value) {
                     try {
@@ -168,9 +221,16 @@ class LocalTelegramBotEngine(
                                             lastUpdateId = updateId + 1
                                         }
 
+                                        // 1. Check for standard message
                                         val messageObj = updateObj.optJSONObject("message")
                                         if (messageObj != null) {
                                             handleIncomingMessage(cleanToken, messageObj)
+                                        }
+
+                                        // 2. Check for interactive callback_query (inline button clicks)
+                                        val callbackQueryObj = updateObj.optJSONObject("callback_query")
+                                        if (callbackQueryObj != null) {
+                                            handleCallbackQuery(cleanToken, callbackQueryObj)
                                         }
                                     }
                                 }
@@ -179,7 +239,7 @@ class LocalTelegramBotEngine(
                     } catch (e: CancellationException) {
                         break
                     } catch (e: Exception) {
-                        Log.w(TAG, "Polling tick error: ${e.message}")
+                        Log.w(TAG, "Polling tick exception: ${e.message}")
                         delay(2500)
                     }
                 }
@@ -206,7 +266,7 @@ class LocalTelegramBotEngine(
     }
 
     /**
-     * Handle incoming Telegram message.
+     * Handle regular incoming Telegram messages.
      */
     private suspend fun handleIncomingMessage(token: String, messageObj: JSONObject) {
         val chatId = messageObj.optJSONObject("chat")?.optLong("id", 0L) ?: return
@@ -218,23 +278,64 @@ class LocalTelegramBotEngine(
         if (text.isBlank()) return
 
         _messagesCount.update { it + 1 }
-        addLog("رسالة", "👤 من @$senderUsername ($senderFirstName): $text")
+        addLog("رسالة", "👤 @$senderUsername ($senderFirstName): $text")
 
+        // Retrieve or initialize session
         val session = sessions.getOrPut(chatId) {
-            TelegramUserSession(chatId = chatId, username = senderUsername, firstName = senderFirstName)
+            TelegramUserSession(
+                chatId = chatId,
+                username = senderUsername,
+                firstName = senderFirstName
+            )
         }
         session.lastActivity = System.currentTimeMillis()
 
-        // Commands
+        // Commands: /start, /help
         if (text == "/start" || text == "/help" || text.equals("start", ignoreCase = true)) {
-            session.state = TelegramUserState.IDLE
-            sendWelcomeMessage(token, chatId, senderFirstName)
-            return
+            if (session.state == TelegramUserState.LOGGED_IN && session.activeToken.isNotBlank()) {
+                val displayPhone = apiClient.formatDisplayPhone(session.activePhone)
+                val welcomeBack = "👋 أهلاً بك مجدداً يا *$senderFirstName*!\n" +
+                        "───────────────────\n" +
+                        "📱 *حسابك النشط:* `$displayPhone`\n" +
+                        "💾 *حالة الجلسة:* ✅ محفوظة ونشطة محلياً\n" +
+                        "⚡ *الاتصال:* مباشر عبر شبكة الهاتف (بدون بروكسي)\n\n" +
+                        "👇 اختر ما ترغب به من القائمة أدناه:"
+                sendMessage(token, chatId, welcomeBack, getMainMenuMarkup())
+                return
+            } else {
+                session.state = TelegramUserState.IDLE
+                saveOrUpdateSession(session)
+                sendWelcomeMessage(token, chatId, senderFirstName)
+                return
+            }
+        }
+
+        // Global Command: /cancel
+        if (text == "/cancel" || text == "رجوع" || text == "إلغاء" || text.contains("رجوع للقائمة")) {
+            if (session.state == TelegramUserState.WAITING_MGM_RECEIVER) {
+                session.state = TelegramUserState.LOGGED_IN
+                saveOrUpdateSession(session)
+                sendMessage(token, chatId, "🔙 تم الرجوع إلى القائمة الرئيسية.", getMainMenuMarkup())
+                return
+            } else if (session.state == TelegramUserState.WAITING_OTP) {
+                session.state = TelegramUserState.IDLE
+                saveOrUpdateSession(session)
+                sendMessage(token, chatId, "🔙 تم إلغاء عملية تسجيل الدخول. أرسل رقم هاتفك في أي وقت للبدء.", null)
+                return
+            }
         }
 
         when (session.state) {
             TelegramUserState.IDLE -> {
-                // Check if user sent a phone number
+                // If user is already logged in but sends a text
+                if (session.activeToken.isNotBlank()) {
+                    session.state = TelegramUserState.LOGGED_IN
+                    saveOrUpdateSession(session)
+                    handleLoggedInAction(token, chatId, session, text)
+                    return
+                }
+
+                // Check if user entered phone number
                 val cleanDigits = text.filter { it.isDigit() }
                 if (cleanDigits.length in 9..12 && (cleanDigits.startsWith("07") || cleanDigits.startsWith("7") || cleanDigits.startsWith("2137"))) {
                     processPhoneInput(token, chatId, session, cleanDigits)
@@ -242,7 +343,7 @@ class LocalTelegramBotEngine(
                     sendMessage(
                         token = token,
                         chatId = chatId,
-                        text = "📱 مرحباً $senderFirstName! يرجى إرسال رقم هاتف جيزي الخاص بك للبدء:\n\nمثال: `0770123456` أو `213770123456`",
+                        text = "👋 مرحباً *$senderFirstName*!\n\n📱 يرجى إرسال رقم هاتف جيزي الخاص بك للبدء وتفعيل العروض:\n\nمثال: `0770123456` أو `0773527865`",
                         replyMarkup = null
                     )
                 }
@@ -252,14 +353,11 @@ class LocalTelegramBotEngine(
                 val cleanOtp = text.filter { it.isDigit() }
                 if (cleanOtp.length == 6) {
                     processOtpInput(token, chatId, session, cleanOtp)
-                } else if (text.equals("إلغاء", ignoreCase = true) || text == "/cancel") {
-                    session.state = TelegramUserState.IDLE
-                    sendMessage(token, chatId, "تم إلغاء العملية. أرسل رقم هاتفك في أي وقت للبدء من جديد.")
                 } else {
                     sendMessage(
                         token = token,
                         chatId = chatId,
-                        text = "⚠️ رمز التحقق (OTP) يجب أن يتكون من 6 أرقام.\nيرجى كتابة الرمز الذي وصلك في رسالة SMS، أو أرسل /start للإلغاء."
+                        text = "⚠️ *رمز التحقق غير صحيح.*\n\n🔢 رمز OTP يجب أن يتكون من 6 أرقام وصلتك في رسالة SMS.\nيرجى كتابته بدقة أو أرسل /cancel للرجوع."
                     )
                 }
             }
@@ -270,6 +368,38 @@ class LocalTelegramBotEngine(
 
             TelegramUserState.WAITING_MGM_RECEIVER -> {
                 processMgmReceiverInput(token, chatId, session, text)
+            }
+        }
+    }
+
+    /**
+     * Handle Interactive Inline Buttons (Callback Queries).
+     */
+    private suspend fun handleCallbackQuery(token: String, callbackQuery: JSONObject) {
+        val queryId = callbackQuery.optString("id", "")
+        val data = callbackQuery.optString("data", "")
+        val fromObj = callbackQuery.optJSONObject("from")
+        val chatId = callbackQuery.optJSONObject("message")?.optJSONObject("chat")?.optLong("id", 0L)
+            ?: fromObj?.optLong("id", 0L)
+            ?: return
+
+        val session = sessions.getOrPut(chatId) {
+            sessionStore.getSession(chatId) ?: TelegramUserSession(chatId = chatId)
+        }
+
+        // Acknowledge callback immediately to dismiss Telegram client spinner
+        answerCallbackQuery(token, queryId, "جاري المعالجة...")
+
+        when (data) {
+            "act_1gb" -> handleLoggedInAction(token, chatId, session, "1 جيجا")
+            "act_2gb" -> handleLoggedInAction(token, chatId, session, "2 جيجا")
+            "act_3gb" -> handleLoggedInAction(token, chatId, session, "3 جيجا")
+            "act_balance" -> handleLoggedInAction(token, chatId, session, "الرصيد")
+            "act_mgm" -> handleLoggedInAction(token, chatId, session, "دعوة")
+            "act_account" -> handleLoggedInAction(token, chatId, session, "حسابي")
+            "act_logout" -> handleLoggedInAction(token, chatId, session, "خروج")
+            "act_menu" -> {
+                sendMessage(token, chatId, "📋 *القائمة الرئيسية للعروض والخدمات:*", getMainMenuMarkup())
             }
         }
     }
@@ -285,25 +415,29 @@ class LocalTelegramBotEngine(
         session.pendingPhone = formatted
 
         addLog("طلب رمز", "📩 إرسال كود OTP للرقم $displayPhone")
-        sendMessage(token, chatId, "⏳ جاري إرسال رمز التحقق (OTP) إلى الرقم $displayPhone عبر شبكة جيزي مباشرة...")
+        sendMessage(token, chatId, "⏳ *جاري إرسال رمز التحقق (OTP) إلى الرقم $displayPhone عبر شبكة جيزي مباشرة...*")
 
         val reqResult = apiClient.requestOtp(formatted)
         if (reqResult.isSuccess) {
             session.state = TelegramUserState.WAITING_OTP
+            saveOrUpdateSession(session)
             addLog("نجاح", "✅ تم إرسال OTP للرقم $displayPhone بنجاح", isSuccess = true)
-            sendMessage(
-                token = token,
-                chatId = chatId,
-                text = "✅ تم إرسال رمز التحقق في رسالة SMS إلى هاتفك: *$displayPhone*\n\n🔢 يرجى إرسال رمز التحقق المكون من 6 أرقام الآن:",
-                replyMarkup = null
-            )
+
+            val otpPrompt = "📩 *تم إرسال رمز التحقق (OTP)*\n" +
+                    "───────────────────\n" +
+                    "📱 *الرقم:* `$displayPhone`\n" +
+                    "📬 تفقد رسائل SMS على هاتفك الآن.\n\n" +
+                    "🔢 *اكتب رمز التحقق المكون من 6 أرقام هنا:*\n\n" +
+                    "*(أو أرسل /cancel للإلغاء)*"
+
+            sendMessage(token, chatId, otpPrompt, null)
         } else {
-            val err = reqResult.exceptionOrNull()?.message ?: "خطأ في الاتصال"
+            val err = reqResult.exceptionOrNull()?.message ?: "خطأ في الاتصال بالشبكة"
             addLog("خطأ", "❌ فشل إرسال OTP للرقم $displayPhone: $err", isError = true)
             sendMessage(
                 token = token,
                 chatId = chatId,
-                text = "❌ تعذر إرسال رمز التحقق للرقم $displayPhone.\nالسبب: $err\n\nتأكد من أن الرقم صحيح ويتبع لشبكة جيزي، ثم حاول مجدداً."
+                text = "❌ *تعذر إرسال رمز التحقق للرقم $displayPhone.*\n\nالسبب: $err\n\nتأكد من أن الرقم صحيح ويتبع لشبكة جيزي، ثم أرسل الرقم مجدداً."
             )
         }
     }
@@ -318,7 +452,7 @@ class LocalTelegramBotEngine(
         val displayPhone = apiClient.formatDisplayPhone(phone)
 
         addLog("تحقق", "🔑 التحقق من رمز OTP للرقم $displayPhone")
-        sendMessage(token, chatId, "⏳ جاري التحقق من الرمز واستخراج التوكن...")
+        sendMessage(token, chatId, "⏳ *جاري التحقق من الرمز واستخراج مفتاح التفعيل...*")
 
         val verifyResult = apiClient.verifyOtp(phone, otp)
         if (verifyResult.isSuccess) {
@@ -326,21 +460,24 @@ class LocalTelegramBotEngine(
             session.activePhone = phone
             session.activeToken = djezzyToken
             session.state = TelegramUserState.LOGGED_IN
-            addLog("تسجيل", "🎉 تم تسجيل الدخول بنجاح للرقم $displayPhone", isSuccess = true)
+            saveOrUpdateSession(session)
+            addLog("تسجيل", "🎉 تم تسجيل الدخول بنجاح وحفظ الجلسة للرقم $displayPhone", isSuccess = true)
 
             val successMsg = "🎉 *تم تسجيل الدخول بنجاح!* 🎉\n" +
-                    "📱 الرقم: `$displayPhone`\n" +
-                    "⚡ الاتصال: محلي مباشر عبر جهازك\n\n" +
-                    "👇 اختر ما ترغب به من القائمة بالأسفل:"
+                    "───────────────────\n" +
+                    "📱 *الرقم النشط:* `$displayPhone`\n" +
+                    "💾 *حفظ الجلسة:* ✅ تم حفظ جلستك (لن تحتاج لتسجيل الدخول مجدداً)\n" +
+                    "⚡ *طريقة العمل:* محلي عبر هاتفك وبدون بروكسي\n\n" +
+                    "👇 *اختر ما ترغب به من الأزرار التفاعلية بالأسفل:*"
 
             sendMessage(token, chatId, successMsg, getMainMenuMarkup())
         } else {
-            val err = verifyResult.exceptionOrNull()?.message ?: "رمز غير صحيح"
+            val err = verifyResult.exceptionOrNull()?.message ?: "رمز غير صحيح أو منتهي الصلاحية"
             addLog("خطأ", "❌ فشل التحقق للرقم $displayPhone: $err", isError = true)
             sendMessage(
                 token = token,
                 chatId = chatId,
-                text = "❌ رمز التحقق غير صحيح أو انتهت صلاحيته!\nيرجى إعادة إدخال الرمز الصحيح، أو أرسل /start للبدء من جديد."
+                text = "❌ *رمز التحقق غير صحيح أو انتهت صلاحيته!*\n\nيرجى إعادة كتابة الرمز الصحيح، أو أرسل /start للمحاولة برقم آخر."
             )
         }
     }
@@ -354,104 +491,182 @@ class LocalTelegramBotEngine(
         val phone = session.activePhone
         val djezzyToken = session.activeToken
         val displayPhone = apiClient.formatDisplayPhone(phone)
+        val timeNow = getFormattedTime()
 
         when {
-            text.contains("1 جيجا") || text.contains("1GB") -> {
-                addLog("تفعيل", "🎁 طلب 1GB مجاناً للرقم $displayPhone")
-                sendMessage(token, chatId, "⏳ جاري تفعيل باقة 1 جيجا مجاناً (MGM) للرقم $displayPhone...\nقد تستغرق العملية بضع ثوانٍ...")
+            text.contains("1 جيجا") || text.contains("1GB") || text == "/1gb" -> {
+                addLog("تفعيل", "🎁 طلب تفعيل 1GB مجاناً للرقم $displayPhone")
+                sendMessage(token, chatId, "⏳ *جاري تفعيل باقة 1 جيجا مجاناً (MGM) للرقم $displayPhone...*\nيرجى الانتظار ثوانٍ قليلة...")
 
                 val result = apiClient.activate1Gb(djezzyToken, phone)
-                val reply = when (result) {
-                    is ActivationResult.Success -> "✅ *${result.message}*"
-                    is ActivationResult.Limit -> "⚠️ *${result.message}*"
+                when (result) {
+                    is ActivationResult.Success -> {
+                        addLog("نجاح", "✅ تم تفعيل 1GB للرقم $displayPhone", isSuccess = true)
+                        val msg = "✨ *بصحتك! تم التفعيل بنجاح* ✨\n" +
+                                "───────────────────\n" +
+                                "📦 *الباقة:* 🎁 1 جيجا مجاناً (عرض MGM)\n" +
+                                "📱 *الرقم المستفيد:* `$displayPhone`\n" +
+                                "⏱️ *التوقيت:* $timeNow\n" +
+                                "📶 *الحالة:* ✅ مفعلة في سيرفرات جيزي بنجاح\n\n" +
+                                "💡 *ملاحظة:* إذا لم يظهر الرصيد فوراً، قم بتشغيل وضع الطيران (Mode Avion) ثم إيقافه لتحديث شبكة الهاتف ✈️"
+                        sendMessage(token, chatId, msg, getMainMenuMarkup(), getOfferResultInlineKeyboard())
+                    }
+                    is ActivationResult.Limit -> {
+                        addLog("تنبيه", "⚠️ حد التفعيل لـ 1GB: ${result.message}")
+                        val msg = "⚠️ *تنبيه من جيزي*\n" +
+                                "───────────────────\n" +
+                                "📱 *الرقم:* `$displayPhone`\n" +
+                                "📝 *الرسالة:* ${result.message}\n\n" +
+                                "ℹ️ يمكنك تفعيل باقة أخرى متوفرة مثل *2 جيجا مشي* من القائمة بالأسفل 👇"
+                        sendMessage(token, chatId, msg, getMainMenuMarkup(), getQuickAlternativesInlineKeyboard())
+                    }
                     is ActivationResult.Expired -> {
                         session.state = TelegramUserState.IDLE
-                        "⌛ انتهت صلاحية الجلسة، يرجى إرسال رقم الهاتف لتسجيل الدخول مجدداً."
+                        session.activeToken = ""
+                        saveOrUpdateSession(session)
+                        addLog("جلسة منتهية", "انتهت صلاحية توكن جيزي للرقم $displayPhone", isError = true)
+                        sendMessage(token, chatId, "⌛ *انتهت صلاحية جلسة جيزي.*\n📱 يرجى إرسال رقم هاتفك لتسجيل الدخول برمز OTP جديد.", null)
                     }
-                    is ActivationResult.Failed -> "❌ *${result.message}*"
+                    is ActivationResult.Failed -> {
+                        addLog("فشل", "❌ فشل تفعيل 1GB: ${result.message}", isError = true)
+                        val msg = "❌ *فشل التفعيل*\n" +
+                                "───────────────────\n" +
+                                "📱 *الرقم:* `$displayPhone`\n" +
+                                "📝 *السبب:* ${result.message}"
+                        sendMessage(token, chatId, msg, getMainMenuMarkup())
+                    }
                 }
-                addLog("نتيجة", "1GB -> $reply", isSuccess = result is ActivationResult.Success, isError = result is ActivationResult.Failed)
-                sendMessage(token, chatId, reply, getMainMenuMarkup())
             }
 
-            text.contains("2 جيجا") || text.contains("مشي") || text.contains("Walk") -> {
-                addLog("تفعيل", "🚶 طلب 2GB مشي للرقم $displayPhone")
-                sendMessage(token, chatId, "⏳ جاري تفعيل باقة 2 جيجا أسبوعياً (Walk & Win) للرقم $displayPhone...")
+            text.contains("2 جيجا") || text.contains("مشي") || text.contains("Walk") || text == "/2gb" -> {
+                addLog("تفعيل", "🚶 طلب تفعيل 2GB مشي للرقم $displayPhone")
+                sendMessage(token, chatId, "⏳ *جاري تفعيل مكافأة المشي 2 جيجا (Walk & Win) للرقم $displayPhone...*")
 
                 val result = apiClient.activate2Gb(djezzyToken, phone)
-                val reply = when (result) {
-                    is ActivationResult.Success -> "✅ *${result.message}*"
-                    is ActivationResult.Limit -> "⚠️ *${result.message}*"
+                when (result) {
+                    is ActivationResult.Success -> {
+                        addLog("نجاح", "✅ تم تفعيل 2GB مشي للرقم $displayPhone", isSuccess = true)
+                        val msg = "✨ *بصحتك! تم تفعيل مكافأة المشي* ✨\n" +
+                                "───────────────────\n" +
+                                "📦 *الباقة:* 🚶 2 جيجا أسبوعياً (Walk & Win)\n" +
+                                "📱 *الرقم المستفيد:* `$displayPhone`\n" +
+                                "⏱️ *التوقيت:* $timeNow\n" +
+                                "📶 *الحالة:* ✅ مفعلة في سيرفرات جيزي بنجاح\n\n" +
+                                "💡 *ملاحظة:* صالحة لمدة 7 أيام وتتجدد أسبوعياً."
+                        sendMessage(token, chatId, msg, getMainMenuMarkup(), getOfferResultInlineKeyboard())
+                    }
+                    is ActivationResult.Limit -> {
+                        addLog("تنبيه", "⚠️ حد التفعيل لـ 2GB: ${result.message}")
+                        val msg = "⚠️ *تنبيه من جيزي*\n" +
+                                "───────────────────\n" +
+                                "📱 *الرقم:* `$displayPhone`\n" +
+                                "📝 *الرسالة:* ${result.message}\n\n" +
+                                "ℹ️ هذه المكافأة متاحة مرة واحدة كل 7 أيام."
+                        sendMessage(token, chatId, msg, getMainMenuMarkup(), getQuickAlternativesInlineKeyboard())
+                    }
                     is ActivationResult.Expired -> {
                         session.state = TelegramUserState.IDLE
-                        "⌛ انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول."
+                        session.activeToken = ""
+                        saveOrUpdateSession(session)
+                        sendMessage(token, chatId, "⌛ *انتهت صلاحية جلسة جيزي.*\n📱 يرجى إعادة إرسال رقم الهاتف للتجديد.", null)
                     }
-                    is ActivationResult.Failed -> "❌ *${result.message}*"
+                    is ActivationResult.Failed -> {
+                        addLog("فشل", "❌ فشل تفعيل 2GB: ${result.message}", isError = true)
+                        sendMessage(token, chatId, "❌ *فشل التفعيل:*\n${result.message}", getMainMenuMarkup())
+                    }
                 }
-                addLog("نتيجة", "2GB -> $reply", isSuccess = result is ActivationResult.Success, isError = result is ActivationResult.Failed)
-                sendMessage(token, chatId, reply, getMainMenuMarkup())
             }
 
-            text.contains("3 جيجا") || text.contains("3GB") -> {
-                addLog("تفعيل", "⚡ طلب باقة 3 جيجا للرقم $displayPhone")
-                sendMessage(token, chatId, "⏳ جاري تفعيل باقة 3 جيجا (1GB + 2GB) للرقم $displayPhone...")
+            text.contains("3 جيجا") || text.contains("3GB") || text == "/3gb" -> {
+                addLog("تفعيل", "⚡ طلب تفعيل باقة 3GB للرقم $displayPhone")
+                sendMessage(token, chatId, "⏳ *جاري تفعيل باقة 3 جيجا المدمجة (1GB + 2GB) للرقم $displayPhone...*")
 
                 val result = apiClient.activate3Gb(djezzyToken, phone)
-                val reply = when (result) {
-                    is ActivationResult.Success -> "✅ *${result.message}*"
-                    is ActivationResult.Limit -> "⚠️ *${result.message}*"
+                when (result) {
+                    is ActivationResult.Success -> {
+                        addLog("نجاح", "✅ تم تفعيل 3GB للرقم $displayPhone", isSuccess = true)
+                        val msg = "⚡ *بصحتك! تم تفعيل باقة 3 جيجا بالكامل* ⚡\n" +
+                                "───────────────────\n" +
+                                "📦 *الباقة:* 🎁 1GB هدية + 🚶 2GB مشي\n" +
+                                "📱 *الرقم المستفيد:* `$displayPhone`\n" +
+                                "⏱️ *التوقيت:* $timeNow\n" +
+                                "📶 *الحالة:* ✅ مفعلة بالكامل بنجاح"
+                        sendMessage(token, chatId, msg, getMainMenuMarkup(), getOfferResultInlineKeyboard())
+                    }
+                    is ActivationResult.Limit -> {
+                        addLog("تنبيه", "⚠️ حد تفعيل 3GB: ${result.message}")
+                        val msg = "⚠️ *تنبيه من جيزي:*\n${result.message}"
+                        sendMessage(token, chatId, msg, getMainMenuMarkup())
+                    }
                     is ActivationResult.Expired -> {
                         session.state = TelegramUserState.IDLE
-                        "⌛ انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول."
+                        session.activeToken = ""
+                        saveOrUpdateSession(session)
+                        sendMessage(token, chatId, "⌛ *انتهت صلاحية جلسة جيزي.*\n📱 يرجى إعادة إرسال رقم الهاتف للتجديد.", null)
                     }
-                    is ActivationResult.Failed -> "❌ *${result.message}*"
+                    is ActivationResult.Failed -> {
+                        addLog("فشل", "❌ فشل 3GB: ${result.message}", isError = true)
+                        sendMessage(token, chatId, "❌ *فشل التفعيل:*\n${result.message}", getMainMenuMarkup())
+                    }
                 }
-                addLog("نتيجة", "3GB -> $reply", isSuccess = result is ActivationResult.Success, isError = result is ActivationResult.Failed)
-                sendMessage(token, chatId, reply, getMainMenuMarkup())
             }
 
-            text.contains("دعوة") || text.contains("MGM") || text.contains("رعاية") -> {
+            text.contains("دعوة") || text.contains("MGM") || text.contains("رعاية") || text == "/mgm" -> {
                 session.state = TelegramUserState.WAITING_MGM_RECEIVER
-                val prompt = "💌 *إرسال دعوة رعاية (MGM)*\n\n" +
-                        "يرجى إرسال رقم هاتف جيزي للشخص الذي ترغب بإرسال الدعوة إليه:\n" +
-                        "مثال: `0773527865` أو `213773527865`\n\n" +
-                        "أو أرسل كلمة 'رجوع' للعودة للقائمة."
+                saveOrUpdateSession(session)
+                val prompt = "💌 *إرسال دعوة رعاية (MGM Send Invitation)*\n" +
+                        "───────────────────\n" +
+                        "🎁 هذه الخدمة ترسل دعوة رسمية من رقمك إلى صديقك ليستفيد من 1GB إنترنت مجاناً!\n\n" +
+                        "📱 *يرجى إرسال رقم هاتف جيزي للشخص المستلم:*\n" +
+                        "مثال: `0773527865` أو `0770123456`\n\n" +
+                        "*(أو أرسل كلمة 'رجوع' للعودة للقائمة)*"
                 sendMessage(token, chatId, prompt, getCancelMarkup())
             }
 
-            text.contains("الرصيد") || text.contains("رصيد") || text.contains("Solde") -> {
+            text.contains("الرصيد") || text.contains("رصيد") || text.contains("Solde") || text == "/balance" -> {
                 addLog("رصيد", "💰 استعلام عن الرصيد للرقم $displayPhone")
-                sendMessage(token, chatId, "⏳ جاري فحص الرصيد من سيرفر جيزي...")
+                sendMessage(token, chatId, "⏳ *جاري فحص الرصيد من سيرفر جيزي الرسمي...*")
 
                 val balanceResult = apiClient.getMainBalance(djezzyToken, phone)
                 if (balanceResult.isSuccess) {
                     val info = balanceResult.getOrThrow()
                     val validityStr = if (info.expirationDate != null) "\n📅 *تاريخ الصلاحية:* ${info.expirationDate}" else ""
-                    val reply = "💰 *تفاصيل الرصيد الأساسي:*\n" +
-                            "📱 الرقم: `$displayPhone`\n" +
-                            "💵 الرصيد: *${info.amount}*$validityStr"
-                    sendMessage(token, chatId, reply, getMainMenuMarkup())
+                    val reply = "💰 *تفاصيل رصيد حسابك:*\n" +
+                            "───────────────────\n" +
+                            "📱 *الرقم:* `$displayPhone`\n" +
+                            "💵 *الرصيد الأساسي:* *${info.amount}*$validityStr\n" +
+                            "⏱️ *وقت الفحص:* $timeNow\n" +
+                            "📶 *حالة الخط:* نشط وجاهز"
+                    sendMessage(token, chatId, reply, getMainMenuMarkup(), getBalanceInlineKeyboard())
                 } else {
                     val err = balanceResult.exceptionOrNull()?.message ?: "فشل فحص الرصيد"
-                    sendMessage(token, chatId, "❌ $err", getMainMenuMarkup())
+                    sendMessage(token, chatId, "❌ *تعذر جلب الرصيد:*\n$err", getMainMenuMarkup())
                 }
             }
 
-            text.contains("خروج") || text.contains("تسجيل خروج") || text.contains("رقم جديد") -> {
-                session.state = TelegramUserState.IDLE
-                session.activePhone = ""
-                session.activeToken = ""
-                addLog("خروج", "🚪 تسجيل خروج للرقم $displayPhone")
-                sendMessage(
-                    token = token,
-                    chatId = chatId,
-                    text = "🚪 تم تسجيل الخروج بنجاح.\n\nأرسل رقم هاتف جيزي جديد للبدء من جديد:",
-                    replyMarkup = null
-                )
+            text.contains("حسابي") || text.contains("معلومات") || text == "/account" -> {
+                val accountMsg = "ℹ️ *تفاصيل حسابك المحفوظ:*\n" +
+                        "───────────────────\n" +
+                        "📱 *الرقم:* `$displayPhone`\n" +
+                        "👤 *المستخدم:* @${session.username.ifBlank { "غير محدد" }}\n" +
+                        "💾 *حالة الجلسة:* ✅ مسجلة ومحفوظة محلياً في هاتفك\n" +
+                        "⚡ *نوع البوت:* خادم محلي بدون وسيط\n\n" +
+                        "لإلغاء هذا الحساب واستخدام رقم آخر، اضغط على زر *تسجيل خروج*."
+                sendMessage(token, chatId, accountMsg, getMainMenuMarkup())
+            }
+
+            text.contains("خروج") || text.contains("تسجيل خروج") || text.contains("رقم جديد") || text == "/logout" -> {
+                deleteSession(chatId)
+                addLog("خروج", "🚪 تم تسجيل الخروج وحذف الجلسة للرقم $displayPhone")
+                val logoutMsg = "🚪 *تم تسجيل الخروج بنجاح.*\n" +
+                        "───────────────────\n" +
+                        "تم مسح بيانات الجلسة السابقة للرقم `$displayPhone`.\n\n" +
+                        "📱 *أرسل رقم هاتف جيزي جديد في أي وقت للبدء:*"
+                sendMessage(token, chatId, logoutMsg, null)
             }
 
             else -> {
-                val help = "❓ لم أفهم اختيارك. يرجى الضغط على أحد الأزرار في القائمة بالأسفل:"
+                val help = "❓ لم أفهم اختيارك. يرجى الضغط على أحد الأزرار التفاعلية بالأسفل 👇"
                 sendMessage(token, chatId, help, getMainMenuMarkup())
             }
         }
@@ -465,7 +680,8 @@ class LocalTelegramBotEngine(
     ) {
         if (receiverText.contains("رجوع") || receiverText.contains("إلغاء") || receiverText == "/cancel") {
             session.state = TelegramUserState.LOGGED_IN
-            sendMessage(token, chatId, "تم الرجوع إلى القائمة الرئيسية.", getMainMenuMarkup())
+            saveOrUpdateSession(session)
+            sendMessage(token, chatId, "🔙 تم الرجوع إلى القائمة الرئيسية.", getMainMenuMarkup())
             return
         }
 
@@ -474,7 +690,7 @@ class LocalTelegramBotEngine(
             sendMessage(
                 token = token,
                 chatId = chatId,
-                text = "⚠️ رقم هاتف غير صالح. يرجى كتابة رقم جيزي صالح (مثال: `0773527865`) أو أرسل 'رجوع':"
+                text = "⚠️ *رقم هاتف غير صالح.*\n\nيرجى كتابة رقم جيزي صالح (مثال: `0773527865`) أو أرسل 'رجوع':"
             )
             return
         }
@@ -482,9 +698,10 @@ class LocalTelegramBotEngine(
         val senderPhone = session.activePhone
         val djezzyToken = session.activeToken
         val displayReceiver = apiClient.formatDisplayPhone(cleanDigits)
+        val displaySender = apiClient.formatDisplayPhone(senderPhone)
 
-        addLog("دعوة", "💌 إرسال دعوة MGM من ${apiClient.formatDisplayPhone(senderPhone)} إلى $displayReceiver")
-        sendMessage(token, chatId, "⏳ جاري إرسال دعوة الرعاية (MGM) إلى $displayReceiver...")
+        addLog("دعوة", "💌 إرسال دعوة MGM من $displaySender إلى $displayReceiver")
+        sendMessage(token, chatId, "⏳ *جاري إرسال دعوة الرعاية (MGM) إلى الرقم $displayReceiver عبر سيرفر جيزي...*")
 
         val result = apiClient.sendMgmInvitation(
             token = djezzyToken,
@@ -493,44 +710,71 @@ class LocalTelegramBotEngine(
         )
 
         session.state = TelegramUserState.LOGGED_IN
+        saveOrUpdateSession(session)
 
-        val reply = when (result) {
-            is ActivationResult.Success -> "🎉 *${result.message}*\nتم تسجيل الدعوة بنجاح في نظام جيزي!"
-            is ActivationResult.Limit -> "⚠️ *${result.message}*"
+        when (result) {
+            is ActivationResult.Success -> {
+                addLog("نجاح", "✅ تم إرسال دعوة MGM إلى $displayReceiver بنجاح", isSuccess = true)
+                val msg = "💌 *تم إرسال دعوة الرعاية بنجاح!* 💌\n" +
+                        "───────────────────\n" +
+                        "📤 *المرسل:* `$displaySender`\n" +
+                        "📥 *المستلم:* `$displayReceiver`\n" +
+                        "🎁 *الهدية:* سيتمكن المستلم من تفعيل 1GB إنترنت مجاناً!\n" +
+                        "⏱️ *التوقيت:* ${getFormattedTime()}\n\n" +
+                        "🎉 شكراً لاستخدامك البوت."
+                sendMessage(token, chatId, msg, getMainMenuMarkup(), getOfferResultInlineKeyboard())
+            }
+            is ActivationResult.Limit -> {
+                addLog("تنبيه", "⚠️ حد الدعوات: ${result.message}")
+                val msg = "⚠️ *تنبيه من جيزي*\n" +
+                        "───────────────────\n" +
+                        "📝 ${result.message}\n" +
+                        "ربما تجاوزت الحد الأقصى للدعوات المسموحة لهذا اليوم."
+                sendMessage(token, chatId, msg, getMainMenuMarkup())
+            }
             is ActivationResult.Expired -> {
                 session.state = TelegramUserState.IDLE
-                "⌛ انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً."
+                session.activeToken = ""
+                saveOrUpdateSession(session)
+                sendMessage(token, chatId, "⌛ *انتهت صلاحية جلسة جيزي.* يرجى تسجيل الدخول مجدداً برقم الهاتف.", null)
             }
-            is ActivationResult.Failed -> "❌ *${result.message}*"
+            is ActivationResult.Failed -> {
+                addLog("فشل", "❌ فشل إرسال الدعوة: ${result.message}", isError = true)
+                sendMessage(token, chatId, "❌ *فشل إرسال الدعوة:*\n${result.message}", getMainMenuMarkup())
+            }
         }
-
-        addLog("دعوة", "نتيجة الدعوة: $reply", isSuccess = result is ActivationResult.Success, isError = result is ActivationResult.Failed)
-        sendMessage(token, chatId, reply, getMainMenuMarkup())
     }
 
     private suspend fun sendWelcomeMessage(token: String, chatId: Long, firstName: String) {
-        val welcome = "👋 مرحباً بك يا *$firstName* في بوت تفعيل خدمات جيزي!\n\n" +
-                "⚡ *المميزات:*\n" +
-                "• 🎁 تفعيل 1 جيجا إنترنت مجاناً (MGM)\n" +
-                "• 🚶 تفعيل 2 جيجا مكافأة المشي (Walk & Win)\n" +
-                "• ⚡ تفعيل باقة 3 جيجا (2GB + 1GB)\n" +
-                "• 💌 إرسال دعوة رعاية (MGM Send Invitation)\n" +
-                "• 💰 الاستعلام عن الرصيد والصلاحية فورياً\n\n" +
-                "🔒 يعمل هذا البوت محلياً ومباشرة عبر جهازك وبدون أي وسيط أو بروكسي.\n\n" +
+        val welcome = "╔══════════════════════╗\n" +
+                "   🇩🇿  *بوت جيزي للمكافآت والعروض*  🇩🇿\n" +
+                "   *Djezzy Local Rewards Bot*\n" +
+                "╚══════════════════════╝\n\n" +
+                "👋 مرحباً بك يا *$firstName* في بوت تفعيل خدمات ومكافآت جيزي مجاناً!\n\n" +
+                "⚡ *المميزات والخدمات المتاحة:*\n" +
+                "• 🎁 *1 جيجا مجاناً* (عرض MGM الشهري)\n" +
+                "• 🚶 *2 جيجا مشي* (تحدي Walk & Win الأسبوعي)\n" +
+                "• ⚡ *باقة 3 جيجا كاملة* (1GB + 2GB معاً)\n" +
+                "• 💌 *إرسال دعوات رعاية (MGM)* لأي رقم جيزي\n" +
+                "• 💰 *استعلام فوري عن الرصيد والصلاحية*\n\n" +
+                "🔒 *ميزة العمل المحلي والحفظ الدائم:*\n" +
+                "يعمل هذا البوت مباشرة من شبكة هاتفك ويحفظ جلستك تلقائياً دون الحاجة لإعادة الدخول كل مرة.\n\n" +
+                "───────────────────\n" +
                 "📱 *للبدء، يرجى إرسال رقم هاتف جيزي الخاص بك:*\n" +
-                "مثال: `0770123456` أو `213770123456`"
+                "مثال: `0770123456` أو `0773527865`"
 
         sendMessage(token, chatId, welcome, null)
     }
 
     /**
-     * Send message to a Telegram chat with markdown formatting and optional ReplyKeyboardMarkup.
+     * Send message to a Telegram chat with Markdown parse mode and optional markup.
      */
     private suspend fun sendMessage(
         token: String,
         chatId: Long,
         text: String,
-        replyMarkup: JSONObject? = null
+        replyMarkup: JSONObject? = null,
+        inlineMarkup: JSONObject? = null
     ) = withContext(Dispatchers.IO) {
         try {
             val url = "$TELEGRAM_API_BASE/bot$token/sendMessage"
@@ -538,8 +782,10 @@ class LocalTelegramBotEngine(
                 put("chat_id", chatId)
                 put("text", text)
                 put("parse_mode", "Markdown")
-                if (replyMarkup != null) {
-                    put("reply_markup", replyMarkup)
+                // If inline markup is provided, it takes precedence in the message bubble
+                val markupToSend = inlineMarkup ?: replyMarkup
+                if (markupToSend != null) {
+                    put("reply_markup", markupToSend)
                 }
             }
 
@@ -550,7 +796,7 @@ class LocalTelegramBotEngine(
 
             telegramHttpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    Log.w(TAG, "sendMessage failed with code ${response.code}")
+                    Log.w(TAG, "sendMessage failed: ${response.code} - ${response.body?.string()}")
                 }
             }
         } catch (e: Exception) {
@@ -558,6 +804,32 @@ class LocalTelegramBotEngine(
         }
     }
 
+    private suspend fun answerCallbackQuery(
+        token: String,
+        callbackQueryId: String,
+        text: String? = null,
+        showAlert: Boolean = false
+    ) = withContext(Dispatchers.IO) {
+        try {
+            val url = "$TELEGRAM_API_BASE/bot$token/answerCallbackQuery"
+            val payload = JSONObject().apply {
+                put("callback_query_id", callbackQueryId)
+                if (text != null) {
+                    put("text", text)
+                    put("show_alert", showAlert)
+                }
+            }
+            val request = Request.Builder()
+                .url(url)
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            telegramHttpClient.newCall(request).execute().close()
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Polished Main Reply Keyboard matching Algerian mobile app conventions.
+     */
     private fun getMainMenuMarkup(): JSONObject {
         val keyboard = JSONArray().apply {
             put(JSONArray().apply {
@@ -570,7 +842,10 @@ class LocalTelegramBotEngine(
             })
             put(JSONArray().apply {
                 put(JSONObject().apply { put("text", "💰 استعلام عن الرصيد") })
-                put(JSONObject().apply { put("text", "🚪 خروج / رقم جديد") })
+                put(JSONObject().apply { put("text", "ℹ️ تفاصيل حسابي") })
+            })
+            put(JSONArray().apply {
+                put(JSONObject().apply { put("text", "🚪 تسجيل خروج / رقم جديد") })
             })
         }
 
@@ -591,6 +866,78 @@ class LocalTelegramBotEngine(
             put("keyboard", keyboard)
             put("resize_keyboard", true)
             put("one_time_keyboard", true)
+        }
+    }
+
+    /**
+     * Inline Keyboard attached after successful activation.
+     */
+    private fun getOfferResultInlineKeyboard(): JSONObject {
+        val inlineKeyboard = JSONArray().apply {
+            put(JSONArray().apply {
+                put(JSONObject().apply {
+                    put("text", "💰 فحص الرصيد الآن")
+                    put("callback_data", "act_balance")
+                })
+                put(JSONObject().apply {
+                    put("text", "💌 إرسال دعوة لصديق")
+                    put("callback_data", "act_mgm")
+                })
+            })
+            put(JSONArray().apply {
+                put(JSONObject().apply {
+                    put("text", "📋 القائمة الكاملة")
+                    put("callback_data", "act_menu")
+                })
+            })
+        }
+        return JSONObject().apply {
+            put("inline_keyboard", inlineKeyboard)
+        }
+    }
+
+    /**
+     * Inline Keyboard attached when an offer hit cooldown limit.
+     */
+    private fun getQuickAlternativesInlineKeyboard(): JSONObject {
+        val inlineKeyboard = JSONArray().apply {
+            put(JSONArray().apply {
+                put(JSONObject().apply {
+                    put("text", "🚶 جرب 2 جيجا مشي")
+                    put("callback_data", "act_2gb")
+                })
+                put(JSONObject().apply {
+                    put("text", "💌 إرسال دعوة MGM")
+                    put("callback_data", "act_mgm")
+                })
+            })
+            put(JSONArray().apply {
+                put(JSONObject().apply {
+                    put("text", "💰 فحص الرصيد")
+                    put("callback_data", "act_balance")
+                })
+            })
+        }
+        return JSONObject().apply {
+            put("inline_keyboard", inlineKeyboard)
+        }
+    }
+
+    private fun getBalanceInlineKeyboard(): JSONObject {
+        val inlineKeyboard = JSONArray().apply {
+            put(JSONArray().apply {
+                put(JSONObject().apply {
+                    put("text", "🔄 تحديث الرصيد")
+                    put("callback_data", "act_balance")
+                })
+                put(JSONObject().apply {
+                    put("text", "🎁 تفعيل 1 جيجا")
+                    put("callback_data", "act_1gb")
+                })
+            })
+        }
+        return JSONObject().apply {
+            put("inline_keyboard", inlineKeyboard)
         }
     }
 }

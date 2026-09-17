@@ -1070,14 +1070,14 @@ fun TelegramBotQuickCard(
                             Spacer(modifier = Modifier.width(6.dp))
                         }
                         Text(
-                            text = if (isRunning) "بوت تيليجرام شغال (@${botUsername ?: "DjezzyBot"})" else "بوت تيليجرام المحلي",
+                            text = if (isRunning) "بوت تيليجرام شغال في الخلفية (@${botUsername ?: "DjezzyBot"})" else "بوت تيليجرام المحلي",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Bold,
                             color = if (isRunning) Color(0xFF0088CC) else MaterialTheme.colorScheme.onSurface
                         )
                     }
                     Text(
-                        text = if (isRunning) "يستقبل طلبات التفعيل ويرسل OTP محلياً بدون بروكسي" else "شغل بوت محلي يستقبل الأكواد ويرسل دعوات MGM",
+                        text = if (isRunning) "شغال دائماً في الخلفية مع حفظ الجلسات وتفعيل فوري محلياً" else "شغل بوت محلي يعمل بالخلفية للأبد ويحفظ الجلسات بدون بروكسي",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontSize = 11.sp

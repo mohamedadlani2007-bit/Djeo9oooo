@@ -13,6 +13,7 @@ import com.example.data.model.ProxyConfig
 import com.example.data.model.TelegramLogItem
 import com.example.data.remote.ActivationResult
 import com.example.data.repository.DjezzyRepository
+import com.example.service.TelegramBotService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -59,7 +60,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val botPrefs = TelegramBotPreferences(application)
     private val repository = DjezzyRepository(
         userAccountDao = database.userAccountDao(),
-        activationHistoryDao = database.activationHistoryDao()
+        activationHistoryDao = database.activationHistoryDao(),
+        context = application
     )
 
     val activeAccount: StateFlow<UserAccountEntity?> = repository.activeAccount
@@ -270,11 +272,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         botPrefs.saveBotToken(cleanToken)
         _uiState.update { it.copy(telegramBotToken = cleanToken) }
-        repository.botEngine.start(cleanToken, viewModelScope)
+        TelegramBotService.start(getApplication(), cleanToken)
+        _uiState.update { it.copy(snackbarMessage = "تم تشغيل البوت في الخلفية بنجاح!") }
     }
 
     fun stopTelegramBot() {
-        repository.botEngine.stop()
+        TelegramBotService.stop(getApplication())
+        _uiState.update { it.copy(snackbarMessage = "تم إيقاف تشغيل البوت") }
     }
 
     fun clearTelegramLogs() {

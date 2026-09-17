@@ -1,6 +1,7 @@
 package com.example.data.remote
 
 import android.util.Log
+import com.example.data.model.MainBalanceInfo
 import com.example.data.model.ProxyConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -43,8 +44,8 @@ class DjezzyApiClient {
         private const val CLIENT_SECRET = "uf82p68Bgisp8Yg1Uz8Pf6_v1XYa"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
-        // Official Djezzy App User-Agent recognized by Djezzy gateway for free zero-rated access
-        const val DJEZZY_USER_AGENT = "DjezzyApp/3.2.0 (Android; Mobile; ZeroRating)"
+        // Official Djezzy App User-Agent recognized by Djezzy gateway
+        const val DJEZZY_USER_AGENT = "MobileApp/3.0.7"
     }
 
     private var currentProxyConfig: ProxyConfig = ProxyConfig()
@@ -80,7 +81,9 @@ class DjezzyApiClient {
 
         // Apply proxy if configured
         if (proxyConfig.isEnabled && proxyConfig.host.isNotBlank() && proxyConfig.port > 0) {
-            val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress(proxyConfig.host, proxyConfig.port))
+            // Use createUnresolved to avoid NetworkOnMainThreadException during client initialization
+            val unresolvedAddress = InetSocketAddress.createUnresolved(proxyConfig.host.trim(), proxyConfig.port)
+            val proxy = Proxy(Proxy.Type.HTTP, unresolvedAddress)
             builder.proxy(proxy)
 
             if (proxyConfig.username.isNotBlank()) {
@@ -95,13 +98,14 @@ class DjezzyApiClient {
             }
         }
 
-        // Ensure all requests carry official Djezzy App headers for zero-rating free network access
+        // Ensure all requests carry official Djezzy App headers
         builder.addInterceptor { chain ->
             val original = chain.request()
             val requestWithHeaders = original.newBuilder()
                 .header("User-Agent", DJEZZY_USER_AGENT)
-                .header("X-App-Version", "3.2.0")
-                .header("X-Client-Platform", "Android")
+                .header("Accept", "application/json")
+                .header("accept-language", "fr")
+                .header("accept-encoding", "gzip")
                 .build()
             chain.proceed(requestWithHeaders)
         }
@@ -461,6 +465,132 @@ class DjezzyApiClient {
             }
         } catch (e: Exception) {
             ActivationResult.Failed("خطأ في الاتصال: ${e.localizedMessage ?: e.message}")
+        }
+    }
+
+    /**
+     * Send MGM referral invitation:
+     * POST /mobile-api/api/v1/services/mgm/send-invitation/{senderMsisdn}
+     * Body: {"msisdnReciever": 213xxxxxxxxx}
+     */
+    suspend fun sendMgmInvitation(
+        token: String,
+        senderPhone: String,
+        receiverPhone: String
+    ): ActivationResult = withContext(Dispatchers.IO) {
+        val cleanSender = formatPhoneNumber(senderPhone)
+        val cleanReceiver = formatPhoneNumber(receiverPhone)
+        try {
+            val payload = JSONObject().apply {
+                val receiverLong = cleanReceiver.toLongOrNull()
+                if (receiverLong != null) {
+                    put("msisdnReciever", receiverLong)
+                } else {
+                    put("msisdnReciever", cleanReceiver)
+                }
+            }
+
+            val request = Request.Builder()
+                .url("$BASE_URL/api/v1/services/mgm/send-invitation/$cleanSender")
+                .header("User-Agent", "MobileApp/3.0.7")
+                .header("Accept", "application/json")
+                .header("accept-language", "fr")
+                .header("accept-encoding", "gzip")
+                .header("Authorization", "Bearer $token")
+                .header("Content-Type", "application/json")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+
+            okHttpClient.newCall(request).execute().use { response ->
+                val code = response.code
+                val text = response.body?.string().orEmpty()
+                Log.d(TAG, "sendMgmInvitation sender: $cleanSender receiver: $cleanReceiver code: $code body: $text")
+
+                when {
+                    code in 200..204 || text.contains("success", ignoreCase = true) -> {
+                        ActivationResult.Success("تم إرسال دعوة الرعاية (MGM) بنجاح إلى $cleanReceiver!")
+                    }
+                    code == 401 -> {
+                        ActivationResult.Expired("انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول.")
+                    }
+                    code == 400 || code == 409 || text.contains("already", ignoreCase = true) -> {
+                        ActivationResult.Failed("الرقم $cleanReceiver تلقى دعوة مسبقاً أو غير مؤهل.")
+                    }
+                    else -> {
+                        ActivationResult.Failed("فشل إرسال الدعوة (كود $code): $text")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            ActivationResult.Failed("خطأ في الاتصال: ${e.localizedMessage ?: e.message}")
+        }
+    }
+
+    /**
+     * Get subscriber main balance directly using official endpoint:
+     * GET /mobile-api/api/v1/subscribers/main-balance/{msisdn}
+     */
+    suspend fun getMainBalance(token: String, phone: String): Result<MainBalanceInfo> = withContext(Dispatchers.IO) {
+        val cleanPhone = formatPhoneNumber(phone)
+        try {
+            val request = Request.Builder()
+                .url("$BASE_URL/api/v1/subscribers/main-balance/$cleanPhone")
+                .header("User-Agent", "MobileApp/3.0.7")
+                .header("Accept", "application/json")
+                .header("accept-language", "fr")
+                .header("accept-encoding", "gzip")
+                .header("Authorization", "Bearer $token")
+                .header("Content-Type", "application/json")
+                .get()
+                .build()
+
+            okHttpClient.newCall(request).execute().use { response ->
+                val code = response.code
+                val body = response.body?.string().orEmpty()
+                Log.d(TAG, "getMainBalance for $cleanPhone: code $code body: $body")
+
+                if (code == 401) {
+                    return@withContext Result.failure(Exception("انتهت صلاحية الجلسة"))
+                }
+
+                if (code in 200..299 && body.isNotBlank()) {
+                    val json = JSONObject(body)
+                    val amount = when {
+                        json.has("mainBalance") -> json.optDouble("mainBalance", 0.0)
+                        json.has("balance") -> json.optDouble("balance", 0.0)
+                        json.has("amount") -> json.optDouble("amount", 0.0)
+                        json.has("credit") -> json.optDouble("credit", 0.0)
+                        json.has("data") -> {
+                            val d = json.optJSONObject("data")
+                            d?.optDouble("mainBalance", d.optDouble("balance", 0.0)) ?: 0.0
+                        }
+                        else -> 0.0
+                    }
+                    val currency = json.optString("currency", "DZD")
+                    val expirationDate = when {
+                        json.has("expirationDate") -> json.optString("expirationDate")
+                        json.has("expiryDate") -> json.optString("expiryDate")
+                        json.has("validityDate") -> json.optString("validityDate")
+                        json.has("data") -> json.optJSONObject("data")?.optString("expirationDate")
+                        else -> null
+                    }
+                    val formatted = String.format(java.util.Locale.US, "%.2f دج", amount)
+                    Result.success(
+                        MainBalanceInfo(
+                            amount = formatted,
+                            rawAmount = amount,
+                            currency = currency,
+                            expirationDate = expirationDate,
+                            isSuccess = true,
+                            rawJson = body
+                        )
+                    )
+                } else {
+                    Result.failure(Exception("فشل جلب الرصيد (كود $code)"))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
         }
     }
 

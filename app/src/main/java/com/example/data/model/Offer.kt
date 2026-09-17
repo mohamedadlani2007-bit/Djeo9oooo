@@ -46,6 +46,17 @@ object AvailableOffers {
             bonus = "دمج مكافأة 1GB + 2GB",
             description = "✅ 3 جيجا إنترنت مجاناً\n✅ تفعيل متوازي لباقة 1GB و 2GB\n✅ السعر: 0 دج",
             isFree = true
+        ),
+        Offer(
+            code = "MGM_INVITE",
+            name = "💌 إرسال دعوة رعاية (MGM)",
+            price = "مجاني (0 دج)",
+            category = "المكافآت المجانية",
+            validity = "فوري",
+            dataVolume = "رصيد دعوات",
+            bonus = "إرسال دعوة لرقم جيزي آخر لكسب إنترنت",
+            description = "✅ إرسال دعوة رسمية لرقم جيزي\n✅ يمنحك رصيد مكافأة MGM بمجرد قبولها\n✅ السعر: 0 دج",
+            isFree = true
         )
     )
 

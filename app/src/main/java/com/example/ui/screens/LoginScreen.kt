@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.Lan
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PhoneAndroid
@@ -43,6 +44,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.SignalCellularAlt
 import androidx.compose.material.icons.filled.SimCard
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -103,6 +105,7 @@ fun LoginScreen(
     onVerifyOtp: (phone: String, otp: String) -> Unit,
     onSelectSavedAccount: (String) -> Unit,
     onOpenProxySettings: () -> Unit = {},
+    onOpenTelegramBot: () -> Unit = {},
     onCancelOtp: () -> Unit = {}
 ) {
     var phoneNumber by remember { mutableStateOf("") }
@@ -177,24 +180,55 @@ fun LoginScreen(
                     fontSize = 15.sp
                 )
 
-                // Language Selector Badge
-                Surface(
-                    shape = RoundedCornerShape(16.dp),
-                    color = Color.White.copy(alpha = 0.9f),
-                    shadowElevation = 1.dp
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                // Top actions: Telegram Bot + Proxy status button + Language Selector Badge
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = onOpenTelegramBot,
+                        modifier = Modifier.size(36.dp).testTag("login_telegram_bot_button")
                     ) {
-                        Text(
-                            text = "العربية",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            color = Color(0xFF222222)
+                        Icon(
+                            Icons.Default.SmartToy,
+                            contentDescription = "بوت تيليجرام المحلي",
+                            tint = Color(0xFF229ED9),
+                            modifier = Modifier.size(22.dp)
                         )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("🌐", fontSize = 12.sp)
+                    }
+
+                    Spacer(modifier = Modifier.width(4.dp))
+
+                    IconButton(
+                        onClick = onOpenProxySettings,
+                        modifier = Modifier.size(36.dp).testTag("login_proxy_settings_button")
+                    ) {
+                        Icon(
+                            Icons.Default.Lan,
+                            contentDescription = "إعدادات البروكسي",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(6.dp))
+
+                    // Language Selector Badge
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = Color.White.copy(alpha = 0.9f),
+                        shadowElevation = 1.dp
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "العربية",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = Color(0xFF222222)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("🌐", fontSize = 12.sp)
+                        }
                     }
                 }
             }

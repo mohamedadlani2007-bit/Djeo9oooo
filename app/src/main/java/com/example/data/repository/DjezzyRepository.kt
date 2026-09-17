@@ -4,10 +4,12 @@ import com.example.data.local.ActivationHistoryDao
 import com.example.data.local.ActivationHistoryEntity
 import com.example.data.local.UserAccountDao
 import com.example.data.local.UserAccountEntity
+import com.example.data.model.MainBalanceInfo
 import com.example.data.model.Offer
 import com.example.data.model.ProxyConfig
 import com.example.data.remote.ActivationResult
 import com.example.data.remote.DjezzyApiClient
+import com.example.data.remote.LocalTelegramBotEngine
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.firstOrNull
 
@@ -16,6 +18,8 @@ class DjezzyRepository(
     private val activationHistoryDao: ActivationHistoryDao,
     private val apiClient: DjezzyApiClient = DjezzyApiClient()
 ) {
+
+    val botEngine: LocalTelegramBotEngine = LocalTelegramBotEngine(apiClient)
 
     companion object {
         const val COOLDOWN_1GB_MS = 24 * 60 * 60 * 1000L // 24 hours
@@ -76,6 +80,54 @@ class DjezzyRepository(
         if (!remaining.isNullOrEmpty()) {
             userAccountDao.setActiveAccount(remaining.first().phone)
         }
+    }
+
+    fun formatDisplayPhone(phone: String): String = apiClient.formatDisplayPhone(phone)
+    fun formatPhoneNumber(phone: String): String = apiClient.formatPhoneNumber(phone)
+
+    suspend fun fetchMainBalance(): Result<MainBalanceInfo> {
+        val current = activeAccount.firstOrNull()
+            ?: return Result.failure(Exception("يرجى تسجيل الدخول برقم جيزي أولاً"))
+        if (current.token == "EXPIRED" || current.token.isBlank()) {
+            return Result.failure(Exception("انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً"))
+        }
+        val result = apiClient.getMainBalance(current.token, current.phone)
+        if (result.isFailure && result.exceptionOrNull()?.message?.contains("انتهت صلاحية الجلسة") == true) {
+            userAccountDao.markTokenExpired(current.phone)
+        }
+        return result
+    }
+
+    suspend fun sendMgmInvitation(receiverPhone: String): ActivationResult {
+        val current = activeAccount.firstOrNull()
+            ?: return ActivationResult.Failed("يرجى تسجيل الدخول برقم جيزي أولاً")
+        if (current.token == "EXPIRED" || current.token.isBlank()) {
+            return ActivationResult.Expired("انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً")
+        }
+        val result = apiClient.sendMgmInvitation(current.token, current.phone, receiverPhone)
+        val cleanReceiver = apiClient.formatDisplayPhone(receiverPhone)
+        val status = when (result) {
+            is ActivationResult.Success -> "SUCCESS"
+            is ActivationResult.Expired -> "EXPIRED"
+            is ActivationResult.Limit -> "LIMIT"
+            is ActivationResult.Failed -> "FAILED"
+        }
+        val message = when (result) {
+            is ActivationResult.Success -> result.message
+            is ActivationResult.Expired -> result.message
+            is ActivationResult.Limit -> result.message
+            is ActivationResult.Failed -> result.message
+        }
+        activationHistoryDao.insertHistory(
+            ActivationHistoryEntity(
+                phone = current.displayPhone,
+                offerCode = "MGM_INVITE",
+                offerName = "دعوة MGM لـ $cleanReceiver",
+                status = status,
+                message = message
+            )
+        )
+        return result
     }
 
     suspend fun activateOffer(
@@ -189,6 +241,4 @@ class DjezzyRepository(
 
         return result
     }
-
-    fun formatDisplayPhone(phone: String): String = apiClient.formatDisplayPhone(phone)
 }

@@ -31,6 +31,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -227,7 +228,28 @@ fun ProxySettingsDialog(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(20.dp))
+                // Reset to direct local connection button
+                if (isEnabled) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextButton(
+                        onClick = {
+                            isEnabled = false
+                            host = ""
+                            port = "8080"
+                            username = ""
+                            password = ""
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "تعطيل البروكسي والعودة للاتصال المباشر",
+                            color = MaterialTheme.colorScheme.outline,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
 
                 // Action Buttons
                 Row(

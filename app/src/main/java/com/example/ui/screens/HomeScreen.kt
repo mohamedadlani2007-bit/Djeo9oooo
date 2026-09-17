@@ -33,9 +33,11 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Lan
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SignalCellularAlt
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material3.AssistChip
@@ -44,6 +46,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -77,6 +80,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.local.UserAccountEntity
 import com.example.data.model.AvailableOffers
+import com.example.data.model.MainBalanceInfo
 import com.example.data.model.Offer
 import com.example.data.model.ProxyConfig
 import com.example.ui.components.CooldownHelper
@@ -94,6 +98,9 @@ fun HomeScreen(
     selectedCategory: String,
     searchQuery: String,
     proxyConfig: ProxyConfig,
+    mainBalance: MainBalanceInfo? = null,
+    isFetchingBalance: Boolean = false,
+    onRefreshBalance: () -> Unit = {},
     onCategorySelected: (String) -> Unit,
     onSearchChanged: (String) -> Unit,
     onSelectOffer: (Offer) -> Unit,
@@ -102,7 +109,11 @@ fun HomeScreen(
     onAddNewAccount: () -> Unit,
     onLogoutAccount: (String) -> Unit,
     onOpenProxySettings: () -> Unit,
-    onOpenHistory: () -> Unit
+    onOpenHistory: () -> Unit,
+    isTelegramBotRunning: Boolean = false,
+    telegramBotUsername: String? = null,
+    onOpenTelegramBot: () -> Unit = {},
+    onOpenMgmInvite: () -> Unit = {}
 ) {
     var showAccountSwitcherSheet by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState()
@@ -169,6 +180,27 @@ fun HomeScreen(
                 },
                 actions = {
                     IconButton(
+                        onClick = onOpenTelegramBot,
+                        modifier = Modifier.testTag("open_telegram_button")
+                    ) {
+                        Box {
+                            Icon(
+                                Icons.Default.SmartToy,
+                                contentDescription = "بوت تيليجرام المحلي",
+                                tint = if (isTelegramBotRunning) Color(0xFF229ED9) else MaterialTheme.colorScheme.onSurface
+                            )
+                            if (isTelegramBotRunning) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF2E7D32))
+                                        .align(Alignment.TopEnd)
+                                )
+                            }
+                        }
+                    }
+                    IconButton(
                         onClick = onOpenHistory,
                         modifier = Modifier.testTag("open_history_button")
                     ) {
@@ -198,10 +230,76 @@ fun HomeScreen(
                 ActiveAccountCard(
                     account = activeAccount,
                     accountCount = allAccounts.size,
+                    mainBalance = mainBalance,
+                    isFetchingBalance = isFetchingBalance,
+                    onRefreshBalance = onRefreshBalance,
                     onOpenSwitcher = { showAccountSwitcherSheet = true },
                     onLogout = { onLogoutAccount(activeAccount.phone) },
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                 )
+            }
+
+            // 2. Local Telegram Bot Status Card
+            item {
+                TelegramBotQuickCard(
+                    isRunning = isTelegramBotRunning,
+                    botUsername = telegramBotUsername,
+                    onClick = onOpenTelegramBot,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+            }
+
+            // Proxy Active Indicator Banner
+            if (proxyConfig.isEnabled) {
+                item {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = DjezzyCyan.copy(alpha = 0.12f),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, DjezzyCyan.copy(alpha = 0.4f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .clickable { onOpenProxySettings() }
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "تعديل",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = DjezzyCyan,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Text(
+                                        text = "بروكسي جزائري نشط مؤقتاً 🇩🇿",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = DjezzyCyan
+                                    )
+                                    Text(
+                                        text = "${proxyConfig.host}:${proxyConfig.port} (الجزائر - الجزائر العاصمة)",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontSize = 10.sp
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Icon(
+                                    Icons.Default.Lan,
+                                    contentDescription = null,
+                                    tint = DjezzyCyan,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+                    }
+                }
             }
 
             // Free Mobile Data Status & Guidance Banner
@@ -511,6 +609,9 @@ fun HomeScreen(
 private fun ActiveAccountCard(
     account: UserAccountEntity,
     accountCount: Int,
+    mainBalance: MainBalanceInfo? = null,
+    isFetchingBalance: Boolean = false,
+    onRefreshBalance: () -> Unit = {},
     onOpenSwitcher: () -> Unit,
     onLogout: () -> Unit,
     modifier: Modifier = Modifier
@@ -576,6 +677,69 @@ private fun ActiveAccountCard(
                             tint = DjezzyRed,
                             modifier = Modifier.size(24.dp)
                         )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Main Balance Section (Fetched from official GET /mobile-api/api/v1/subscribers/main-balance/{msisdn})
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Refresh balance button
+                    IconButton(
+                        onClick = onRefreshBalance,
+                        enabled = !isFetchingBalance,
+                        modifier = Modifier.size(34.dp).testTag("refresh_balance_button")
+                    ) {
+                        if (isFetchingBalance) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = DjezzyRed
+                            )
+                        } else {
+                            Icon(
+                                Icons.Default.Refresh,
+                                contentDescription = "تحديث الرصيد",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text(
+                            text = "الرصيد الرئيسي",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = mainBalance?.amount ?: "— دج",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Black,
+                                color = if (mainBalance != null) DjezzyGreen else MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        if (!mainBalance?.expirationDate.isNullOrBlank()) {
+                            Text(
+                                text = "صالح إلى: ${mainBalance!!.expirationDate}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.outline,
+                                fontSize = 10.sp
+                            )
+                        }
                     }
                 }
             }
@@ -841,6 +1005,97 @@ private fun OfferItemCard(
                         style = MaterialTheme.typography.bodySmall,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TelegramBotQuickCard(
+    isRunning: Boolean,
+    botUsername: String?,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = if (isRunning) Color(0xFF229ED9).copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (isRunning) Color(0xFF229ED9).copy(alpha = 0.45f) else MaterialTheme.colorScheme.outlineVariant
+        ),
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .testTag("telegram_quick_card")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = if (isRunning) Color(0xFF0088CC) else MaterialTheme.colorScheme.primary
+            ) {
+                Text(
+                    text = if (isRunning) "إدارة البوت" else "تشغيل البوت",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                )
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(start = 12.dp),
+                horizontalArrangement = Arrangement.End
+            ) {
+                Column(horizontalAlignment = Alignment.End) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (isRunning) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF2E7D32))
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                        }
+                        Text(
+                            text = if (isRunning) "بوت تيليجرام شغال (@${botUsername ?: "DjezzyBot"})" else "بوت تيليجرام المحلي",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isRunning) Color(0xFF0088CC) else MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    Text(
+                        text = if (isRunning) "يستقبل طلبات التفعيل ويرسل OTP محلياً بدون بروكسي" else "شغل بوت محلي يستقبل الأكواد ويرسل دعوات MGM",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 11.sp
+                    )
+                }
+                Spacer(modifier = Modifier.width(10.dp))
+                Box(
+                    modifier = Modifier
+                        .size(38.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFF229ED9).copy(alpha = 0.2f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Default.SmartToy,
+                        contentDescription = null,
+                        tint = Color(0xFF0088CC),
+                        modifier = Modifier.size(22.dp)
                     )
                 }
             }

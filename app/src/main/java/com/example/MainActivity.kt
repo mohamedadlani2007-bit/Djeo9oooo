@@ -24,6 +24,8 @@ import com.example.ui.dialogs.ActivationProgressDialog
 import com.example.ui.dialogs.HistoryDialog
 import com.example.ui.dialogs.OfferDetailsDialog
 import com.example.ui.dialogs.ProxySettingsDialog
+import com.example.ui.dialogs.SendMgmDialog
+import com.example.ui.dialogs.TelegramBotDialog
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.LoginScreen
 import com.example.ui.theme.MyApplicationTheme
@@ -82,6 +84,7 @@ fun DjezzyApp(viewModel: MainViewModel) {
                         viewModel.showAddAccount(false)
                     },
                     onOpenProxySettings = { viewModel.showProxyDialog(true) },
+                    onOpenTelegramBot = { viewModel.showTelegramBotDialog(true) },
                     onCancelOtp = { viewModel.showAddAccount(false) }
                 )
             } else {
@@ -91,6 +94,9 @@ fun DjezzyApp(viewModel: MainViewModel) {
                     selectedCategory = uiState.selectedCategory,
                     searchQuery = uiState.searchQuery,
                     proxyConfig = uiState.proxyConfig,
+                    mainBalance = uiState.mainBalance,
+                    isFetchingBalance = uiState.isFetchingBalance,
+                    onRefreshBalance = { viewModel.refreshMainBalance() },
                     onCategorySelected = { cat -> viewModel.setCategory(cat) },
                     onSearchChanged = { q -> viewModel.setSearchQuery(q) },
                     onSelectOffer = { offer -> viewModel.openOfferDetails(offer) },
@@ -99,7 +105,11 @@ fun DjezzyApp(viewModel: MainViewModel) {
                     onAddNewAccount = { viewModel.showAddAccount(true) },
                     onLogoutAccount = { phone -> viewModel.logoutAccount(phone) },
                     onOpenProxySettings = { viewModel.showProxyDialog(true) },
-                    onOpenHistory = { viewModel.showHistoryDialog(true) }
+                    onOpenHistory = { viewModel.showHistoryDialog(true) },
+                    isTelegramBotRunning = uiState.isTelegramBotRunning,
+                    telegramBotUsername = uiState.telegramBotUsername,
+                    onOpenTelegramBot = { viewModel.showTelegramBotDialog(true) },
+                    onOpenMgmInvite = { viewModel.showMgmInviteDialog(true) }
                 )
             }
 
@@ -138,6 +148,29 @@ fun DjezzyApp(viewModel: MainViewModel) {
                 HistoryDialog(
                     historyList = historyList,
                     onDismiss = { viewModel.showHistoryDialog(false) }
+                )
+            }
+
+            if (uiState.showTelegramBotDialog) {
+                TelegramBotDialog(
+                    initialToken = uiState.telegramBotToken,
+                    isRunning = uiState.isTelegramBotRunning,
+                    botUsername = uiState.telegramBotUsername,
+                    messagesCount = uiState.telegramMessagesCount,
+                    logs = uiState.telegramLogs,
+                    onDismiss = { viewModel.showTelegramBotDialog(false) },
+                    onStartBot = { token -> viewModel.startTelegramBot(token) },
+                    onStopBot = { viewModel.stopTelegramBot() },
+                    onClearLogs = { viewModel.clearTelegramLogs() },
+                    onTestToken = { token, cb -> viewModel.testTelegramToken(token, cb) }
+                )
+            }
+
+            if (uiState.showMgmInviteDialog && activeAccount != null) {
+                SendMgmDialog(
+                    senderPhone = activeAccount!!.displayPhone,
+                    onDismiss = { viewModel.showMgmInviteDialog(false) },
+                    onSendInvite = { receiver -> viewModel.sendMgmInvitation(receiver) }
                 )
             }
         }

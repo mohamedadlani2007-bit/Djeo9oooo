@@ -4,10 +4,13 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.AppDatabase
+import com.example.data.local.TelegramBotPreferences
 import com.example.data.local.UserAccountEntity
 import com.example.data.model.AvailableOffers
+import com.example.data.model.MainBalanceInfo
 import com.example.data.model.Offer
 import com.example.data.model.ProxyConfig
+import com.example.data.model.TelegramLogItem
 import com.example.data.remote.ActivationResult
 import com.example.data.repository.DjezzyRepository
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -30,17 +33,30 @@ data class UiState(
     val showAddAccountSheet: Boolean = false,
     val showProxyDialog: Boolean = false,
     val showHistoryDialog: Boolean = false,
+    val showTelegramBotDialog: Boolean = false,
+    val showMgmInviteDialog: Boolean = false,
     val isTestingConnection: Boolean = false,
     val connectionTestStatus: String? = null,
     val selectedCategory: String = "الكل",
     val searchQuery: String = "",
     val snackbarMessage: String? = null,
-    val proxyConfig: ProxyConfig = ProxyConfig()
+    val proxyConfig: ProxyConfig = ProxyConfig(),
+    val mainBalance: MainBalanceInfo? = null,
+    val isFetchingBalance: Boolean = false,
+    // Telegram Bot state
+    val telegramBotToken: String = "",
+    val isTelegramBotRunning: Boolean = false,
+    val telegramBotUsername: String? = null,
+    val telegramMessagesCount: Int = 0,
+    val telegramLogs: List<TelegramLogItem> = emptyList(),
+    // MGM Invite state
+    val isSendingMgmInvite: Boolean = false
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val database = AppDatabase.getDatabase(application)
+    private val botPrefs = TelegramBotPreferences(application)
     private val repository = DjezzyRepository(
         userAccountDao = database.userAccountDao(),
         activationHistoryDao = database.activationHistoryDao()
@@ -55,8 +71,61 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val historyList = repository.allHistory
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    private val _uiState = MutableStateFlow(UiState())
+    private val _uiState = MutableStateFlow(UiState(telegramBotToken = botPrefs.getBotToken()))
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            activeAccount.collect { account ->
+                if (account != null && account.token.isNotBlank() && account.token != "EXPIRED") {
+                    refreshMainBalance()
+                } else {
+                    _uiState.update { it.copy(mainBalance = null) }
+                }
+            }
+        }
+
+        // Collect Bot state
+        viewModelScope.launch {
+            repository.botEngine.isRunning.collect { running ->
+                _uiState.update { it.copy(isTelegramBotRunning = running) }
+            }
+        }
+        viewModelScope.launch {
+            repository.botEngine.botUsername.collect { username ->
+                _uiState.update { it.copy(telegramBotUsername = username) }
+            }
+        }
+        viewModelScope.launch {
+            repository.botEngine.botLogs.collect { logs ->
+                _uiState.update { it.copy(telegramLogs = logs) }
+            }
+        }
+        viewModelScope.launch {
+            repository.botEngine.messagesCount.collect { count ->
+                _uiState.update { it.copy(telegramMessagesCount = count) }
+            }
+        }
+    }
+
+    fun refreshMainBalance() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isFetchingBalance = true) }
+            val result = repository.fetchMainBalance()
+            if (result.isSuccess) {
+                _uiState.update {
+                    it.copy(
+                        isFetchingBalance = false,
+                        mainBalance = result.getOrNull()
+                    )
+                }
+            } else {
+                _uiState.update {
+                    it.copy(isFetchingBalance = false)
+                }
+            }
+        }
+    }
 
     fun setCategory(category: String) {
         _uiState.update { it.copy(selectedCategory = category) }
@@ -157,6 +226,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun activateOffer(offer: Offer) {
         closeOfferDetails()
+        if (offer.code == "MGM_INVITE") {
+            showMgmInviteDialog(true)
+            return
+        }
+
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
@@ -171,6 +245,72 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { it.copy(activationProgressStep = step) }
             }
 
+            _uiState.update {
+                it.copy(
+                    isActivating = false,
+                    activationResult = result
+                )
+            }
+        }
+    }
+
+    fun showTelegramBotDialog(show: Boolean) {
+        _uiState.update { it.copy(showTelegramBotDialog = show) }
+    }
+
+    fun showMgmInviteDialog(show: Boolean) {
+        _uiState.update { it.copy(showMgmInviteDialog = show) }
+    }
+
+    fun startTelegramBot(token: String) {
+        val cleanToken = token.trim()
+        if (cleanToken.isBlank()) {
+            _uiState.update { it.copy(snackbarMessage = "يرجى كتابة توكن البوت أولاً") }
+            return
+        }
+        botPrefs.saveBotToken(cleanToken)
+        _uiState.update { it.copy(telegramBotToken = cleanToken) }
+        repository.botEngine.start(cleanToken, viewModelScope)
+    }
+
+    fun stopTelegramBot() {
+        repository.botEngine.stop()
+    }
+
+    fun clearTelegramLogs() {
+        repository.botEngine.clearLogs()
+    }
+
+    fun testTelegramToken(token: String, onResult: (Boolean, String) -> Unit) {
+        viewModelScope.launch {
+            val res = repository.botEngine.testToken(token)
+            if (res.isSuccess) {
+                onResult(true, res.getOrThrow())
+            } else {
+                onResult(false, res.exceptionOrNull()?.message ?: "توكن غير صالح")
+            }
+        }
+    }
+
+    fun sendMgmInvitation(receiverPhone: String) {
+        val current = activeAccount.value
+        if (current == null) {
+            _uiState.update { it.copy(snackbarMessage = "يرجى تسجيل الدخول أولاً") }
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isActivating = true,
+                    activatingOfferName = "إرسال دعوة رعاية (MGM)",
+                    activationProgressStep = "جاري إرسال الدعوة إلى $receiverPhone عبر سيرفر جيزي...",
+                    activationResult = null,
+                    showMgmInviteDialog = false
+                )
+            }
+
+            val result = repository.sendMgmInvitation(receiverPhone)
             _uiState.update {
                 it.copy(
                     isActivating = false,

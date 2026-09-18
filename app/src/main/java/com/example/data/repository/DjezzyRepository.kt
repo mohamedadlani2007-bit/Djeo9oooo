@@ -25,6 +25,7 @@ class DjezzyRepository(
     val botEngine: LocalTelegramBotEngine = LocalTelegramBotEngine.getInstance(context, apiClient)
 
     companion object {
+        const val SESSION_DURATION_MS = 4 * 60 * 60 * 1000L // 4 hours session limit
         const val COOLDOWN_1GB_MS = 24 * 60 * 60 * 1000L // 24 hours
         const val COOLDOWN_2GB_MS = 7 * 24 * 60 * 60 * 1000L // 7 days
         const val COOLDOWN_3GB_MS = 7 * 24 * 60 * 60 * 1000L // 7 days
@@ -33,6 +34,29 @@ class DjezzyRepository(
     val allAccounts: Flow<List<UserAccountEntity>> = userAccountDao.getAllAccounts()
     val activeAccount: Flow<UserAccountEntity?> = userAccountDao.getActiveAccount()
     val allHistory: Flow<List<ActivationHistoryEntity>> = activationHistoryDao.getAllHistory()
+
+    fun isSessionExpired(account: UserAccountEntity): Boolean {
+        if (account.token == "EXPIRED" || account.token.isBlank()) return true
+        val elapsed = System.currentTimeMillis() - account.addedDate
+        return elapsed >= SESSION_DURATION_MS
+    }
+
+    fun getSessionRemainingMs(account: UserAccountEntity): Long {
+        if (account.token == "EXPIRED" || account.token.isBlank()) return 0L
+        val elapsed = System.currentTimeMillis() - account.addedDate
+        val remaining = SESSION_DURATION_MS - elapsed
+        return if (remaining > 0) remaining else 0L
+    }
+
+    suspend fun checkAndExpireSession(account: UserAccountEntity): Boolean {
+        if (isSessionExpired(account)) {
+            if (account.token != "EXPIRED") {
+                userAccountDao.markTokenExpired(account.phone)
+            }
+            return true
+        }
+        return false
+    }
 
     fun updateProxyConfig(config: ProxyConfig) {
         apiClient.updateProxy(config)
@@ -52,17 +76,20 @@ class DjezzyRepository(
             val token = result.getOrThrow()
             val cleanPhone = apiClient.formatPhoneNumber(phone)
             val displayPhone = apiClient.formatDisplayPhone(phone)
+            val now = System.currentTimeMillis()
 
             val existing = userAccountDao.getAccountByPhone(cleanPhone)
             val account = existing?.copy(
                 token = token,
                 isActive = true,
-                displayPhone = displayPhone
+                displayPhone = displayPhone,
+                addedDate = now
             ) ?: UserAccountEntity(
                 phone = cleanPhone,
                 displayPhone = displayPhone,
                 token = token,
-                isActive = true
+                isActive = true,
+                addedDate = now
             )
 
             userAccountDao.insertOrUpdateAccount(account)
@@ -91,8 +118,8 @@ class DjezzyRepository(
     suspend fun fetchMainBalance(): Result<MainBalanceInfo> {
         val current = activeAccount.firstOrNull()
             ?: return Result.failure(Exception("يرجى تسجيل الدخول برقم جيزي أولاً"))
-        if (current.token == "EXPIRED" || current.token.isBlank()) {
-            return Result.failure(Exception("انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً"))
+        if (checkAndExpireSession(current)) {
+            return Result.failure(Exception("انتهت صلاحية الجلسة بعد مرور 4 ساعات. يرجى تسجيل الدخول مجدداً لتجديد الرمز."))
         }
         val result = apiClient.getMainBalance(current.token, current.phone)
         if (result.isFailure && result.exceptionOrNull()?.message?.contains("انتهت صلاحية الجلسة") == true) {
@@ -104,8 +131,8 @@ class DjezzyRepository(
     suspend fun getMgmStatus(): Result<MgmStatusInfo> {
         val current = activeAccount.firstOrNull()
             ?: return Result.failure(Exception("يرجى تسجيل الدخول برقم جيزي أولاً"))
-        if (current.token == "EXPIRED" || current.token.isBlank()) {
-            return Result.failure(Exception("انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً"))
+        if (checkAndExpireSession(current)) {
+            return Result.failure(Exception("انتهت صلاحية الجلسة بعد مرور 4 ساعات. يرجى تسجيل الدخول مجدداً لتجديد الرمز."))
         }
         val result = apiClient.getMgmCustomerOffers(current.token, current.phone)
         if (result.isFailure && result.exceptionOrNull()?.message?.contains("انتهت صلاحية الجلسة") == true) {
@@ -117,8 +144,8 @@ class DjezzyRepository(
     suspend fun sendMgmInvitation(receiverPhone: String): ActivationResult {
         val current = activeAccount.firstOrNull()
             ?: return ActivationResult.Failed("يرجى تسجيل الدخول برقم جيزي أولاً")
-        if (current.token == "EXPIRED" || current.token.isBlank()) {
-            return ActivationResult.Expired("انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً")
+        if (checkAndExpireSession(current)) {
+            return ActivationResult.Expired("انتهت صلاحية الجلسة بعد مرور 4 ساعات. يرجى تسجيل الدخول مجدداً لتجديد الرمز.")
         }
         val result = apiClient.sendMgmInvitation(current.token, current.phone, receiverPhone)
         val cleanReceiver = apiClient.formatDisplayPhone(receiverPhone)
@@ -153,8 +180,8 @@ class DjezzyRepository(
         val current = activeAccount.firstOrNull()
             ?: return ActivationResult.Failed("يرجى تسجيل الدخول برقم جيزي أولاً")
 
-        if (current.token == "EXPIRED" || current.token.isBlank()) {
-            return ActivationResult.Expired("انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً")
+        if (checkAndExpireSession(current)) {
+            return ActivationResult.Expired("انتهت صلاحية الجلسة بعد مرور 4 ساعات. يرجى تسجيل الدخول مجدداً لتجديد الرمز.")
         }
 
         val currentTime = System.currentTimeMillis()

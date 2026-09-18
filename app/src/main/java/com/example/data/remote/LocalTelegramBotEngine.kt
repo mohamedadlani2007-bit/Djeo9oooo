@@ -43,23 +43,35 @@ import java.util.concurrent.TimeUnit
  */
 class LocalTelegramBotEngine private constructor(
     context: Context,
-    private val apiClient: DjezzyApiClient
+    private var apiClient: DjezzyApiClient
 ) {
     companion object {
         private const val TAG = "TelegramBotEngine"
         private const val TELEGRAM_API_BASE = "https://api.telegram.org"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private const val MAX_MGM_INVITES = 5
+        const val SESSION_DURATION_MS = 4 * 60 * 60 * 1000L // 4 hours session limit
 
         @Volatile
         private var instance: LocalTelegramBotEngine? = null
 
         fun getInstance(context: Context, apiClient: DjezzyApiClient = DjezzyApiClient()): LocalTelegramBotEngine {
-            return instance ?: synchronized(this) {
-                instance ?: LocalTelegramBotEngine(
-                    context = context.applicationContext,
-                    apiClient = apiClient
-                ).also { instance = it }
+            val existing = instance
+            if (existing != null) {
+                existing.apiClient = apiClient
+                return existing
+            }
+            return synchronized(this) {
+                val synced = instance
+                if (synced != null) {
+                    synced.apiClient = apiClient
+                    synced
+                } else {
+                    LocalTelegramBotEngine(
+                        context = context.applicationContext,
+                        apiClient = apiClient
+                    ).also { instance = it }
+                }
             }
         }
     }
@@ -144,6 +156,30 @@ class LocalTelegramBotEngine private constructor(
     private fun getActiveAccount(session: TelegramUserSession): SavedTelegramPhoneAccount? {
         return session.savedAccounts.find { it.phone == session.activePhone }
             ?: session.savedAccounts.firstOrNull()
+    }
+
+    /**
+     * Checks if the 4-hour session limit has expired for this Telegram session.
+     */
+    private fun isSessionExpired(session: TelegramUserSession): Boolean {
+        if (session.state != TelegramUserState.LOGGED_IN || session.activeToken.isBlank()) return true
+        val activeAcc = getActiveAccount(session) ?: return true
+        if (activeAcc.token.isBlank()) return true
+        val elapsed = System.currentTimeMillis() - activeAcc.addedAt
+        return elapsed >= SESSION_DURATION_MS
+    }
+
+    /**
+     * Formats remaining time before the 4-hour session expires.
+     */
+    private fun getSessionRemainingFormatted(session: TelegramUserSession): String {
+        val activeAcc = getActiveAccount(session) ?: return "منتهية"
+        val elapsed = System.currentTimeMillis() - activeAcc.addedAt
+        val remaining = SESSION_DURATION_MS - elapsed
+        if (remaining <= 0) return "منتهية"
+        val hours = remaining / (1000 * 60 * 60)
+        val minutes = (remaining % (1000 * 60 * 60)) / (1000 * 60)
+        return if (hours > 0) "$hours ساعة و $minutes دقيقة" else "$minutes دقيقة"
     }
 
     /**
@@ -330,16 +366,22 @@ class LocalTelegramBotEngine private constructor(
 
         // Global Command: /start, /help
         if (text == "/start" || text == "/help" || text.equals("start", ignoreCase = true)) {
-            if (session.state == TelegramUserState.LOGGED_IN && session.activeToken.isNotBlank()) {
+            if (session.state == TelegramUserState.LOGGED_IN && session.activeToken.isNotBlank() && !isSessionExpired(session)) {
                 val displayPhone = apiClient.formatDisplayPhone(session.activePhone)
+                val remaining = getSessionRemainingFormatted(session)
                 val welcomeBack = "👋 أهلاً بك مجدداً يا *$senderFirstName*!\n" +
                         "───────────────────\n" +
                         "📱 *الرقم النشط:* `$displayPhone`\n" +
+                        "⏳ *صلاحية الجلسة:* باقي $remaining (تتجدد كل 4 ساعات)\n" +
                         "💾 *أرقامك المسجلة:* ${session.savedAccounts.size} أرقام\n\n" +
                         "👇 اختر ما ترغب به من القائمة أدناه:"
                 sendMessage(token, chatId, welcomeBack, getMainMenuMarkup())
                 return
             } else {
+                if (session.activeToken.isNotBlank() && isSessionExpired(session)) {
+                    promptReLogin(token, chatId, session)
+                    return
+                }
                 session.state = TelegramUserState.IDLE
                 saveOrUpdateSession(session)
                 sendWelcomeMessage(token, chatId, senderFirstName)
@@ -349,7 +391,7 @@ class LocalTelegramBotEngine private constructor(
 
         // Global Command: /cancel, رجوع, إلغاء
         if (text == "/cancel" || text == "رجوع" || text == "إلغاء" || text.contains("رجوع للقائمة")) {
-            session.state = if (session.activeToken.isNotBlank()) TelegramUserState.LOGGED_IN else TelegramUserState.IDLE
+            session.state = if (session.activeToken.isNotBlank() && !isSessionExpired(session)) TelegramUserState.LOGGED_IN else TelegramUserState.IDLE
             saveOrUpdateSession(session)
             sendMessage(token, chatId, "🔙 تم الرجوع إلى القائمة الرئيسية.", if (session.state == TelegramUserState.LOGGED_IN) getMainMenuMarkup() else null)
             return
@@ -358,6 +400,10 @@ class LocalTelegramBotEngine private constructor(
         when (session.state) {
             TelegramUserState.IDLE -> {
                 if (session.activeToken.isNotBlank()) {
+                    if (isSessionExpired(session)) {
+                        promptReLogin(token, chatId, session)
+                        return
+                    }
                     session.state = TelegramUserState.LOGGED_IN
                     saveOrUpdateSession(session)
                     handleLoggedInAction(token, chatId, session, text)
@@ -482,16 +528,16 @@ class LocalTelegramBotEngine private constructor(
         val displayPhone = apiClient.formatDisplayPhone(rawPhone)
         session.pendingPhone = formatted
 
-        addLog("طلب رمز", "📩 إرسال كود OTP للرقم $displayPhone")
-        sendMessage(token, chatId, "⏳ *جاري إرسال رمز التحقق (OTP) إلى الرقم $displayPhone...*")
+        addLog("طلب رمز", "📩 إرسال كود OTP للرقم $displayPhone عبر شبكة الهاتف المتصلة")
+        sendMessage(token, chatId, "⏳ *جاري إرسال رمز التحقق (OTP) إلى الرقم $displayPhone عبر شبكة الهاتف مباشرة...*")
 
         val reqResult = apiClient.requestOtp(formatted)
         if (reqResult.isSuccess) {
             session.state = if (isAddingNewAccount) TelegramUserState.WAITING_NEW_PHONE_OTP else TelegramUserState.WAITING_OTP
             saveOrUpdateSession(session)
-            addLog("نجاح", "✅ تم إرسال OTP للرقم $displayPhone بنجاح", isSuccess = true)
+            addLog("نجاح", "✅ تم إرسال OTP للرقم $displayPhone بنجاح عبر شبكة الهاتف المحلية", isSuccess = true)
 
-            val otpPrompt = "📩 *تم إرسال رمز التحقق (OTP)*\n" +
+            val otpPrompt = "📩 *تم إرسال رمز التحقق (OTP) عبر شبكة جيزي*\n" +
                     "───────────────────\n" +
                     "📱 *الرقم:* `$displayPhone`\n" +
                     "📬 تفقد رسائل SMS على هاتفك الآن.\n\n" +
@@ -501,11 +547,11 @@ class LocalTelegramBotEngine private constructor(
             sendMessage(token, chatId, otpPrompt, null)
         } else {
             val userFriendlyError = sanitizeErrorMessage(reqResult.exceptionOrNull()?.message)
-            addLog("خطأ", "❌ فشل إرسال OTP للرقم $displayPhone", isError = true)
+            addLog("خطأ", "❌ فشل إرسال OTP للرقم $displayPhone عبر الشبكة", isError = true)
             sendMessage(
                 token = token,
                 chatId = chatId,
-                text = "❌ *تعذر إرسال رمز التحقق.*\n\n$userFriendlyError\n\nتأكد من صحة رقم جيزي وأعد المحاولة."
+                text = "❌ *تعذر إرسال رمز التحقق عبر الشبكة.*\n\n$userFriendlyError\n\nتأكد من صحة رقم جيزي وتوفر اتصال بالشبكة وأعد المحاولة."
             )
         }
     }
@@ -528,14 +574,17 @@ class LocalTelegramBotEngine private constructor(
             val djezzyToken = verifyResult.getOrThrow()
 
             // Update or add to savedAccounts
+            val now = System.currentTimeMillis()
             val existing = session.savedAccounts.find { it.phone == phone }
             if (existing != null) {
                 existing.token = djezzyToken
+                existing.addedAt = now
             } else {
                 session.savedAccounts.add(
                     SavedTelegramPhoneAccount(
                         phone = phone,
-                        token = djezzyToken
+                        token = djezzyToken,
+                        addedAt = now
                     )
                 )
             }
@@ -551,13 +600,14 @@ class LocalTelegramBotEngine private constructor(
                 "🎉 *تمت إضافة الرقم بنجاح!* 🎉\n" +
                         "───────────────────\n" +
                         "📱 *الرقم النشط حالياً:* `$displayPhone`\n" +
+                        "⏳ *صلاحية الجلسة:* صالحة لـ 4 ساعات\n" +
                         "💾 *إجمالي أرقامك المحفوظة:* ${session.savedAccounts.size} أرقام\n\n" +
                         "يمكنك التبديل بين أرقامك في أي وقت من زر *[📱 إدارة أرقامي]*."
             } else {
                 "🎉 *تم تسجيل الدخول بنجاح!* 🎉\n" +
                         "───────────────────\n" +
                         "📱 *الرقم النشط:* `$displayPhone`\n" +
-                        "💾 *حفظ دائم:* تم حفظ جلستك ولن تحتاج لتسجيل الدخول مجدداً.\n" +
+                        "⏳ *صلاحية الجلسة:* صالحة لـ 4 ساعات (وفق نظام جيزي لحماية أمان خطك)\n" +
                         "📱 *ميزة الأرقام المتعددة:* يمكنك إضافة 3، 5، أو أي عدد من الأرقام والتبديل بينها فوراً!"
             }
 
@@ -579,6 +629,10 @@ class LocalTelegramBotEngine private constructor(
         session: TelegramUserSession,
         text: String
     ) {
+        if (isSessionExpired(session)) {
+            promptReLogin(token, chatId, session)
+            return
+        }
         val phone = session.activePhone
         val djezzyToken = session.activeToken
         val displayPhone = apiClient.formatDisplayPhone(phone)
@@ -985,7 +1039,14 @@ class LocalTelegramBotEngine private constructor(
         session.savedAccounts.forEachIndexed { index, acc ->
             val display = apiClient.formatDisplayPhone(acc.phone)
             val isActive = acc.phone == activePhone
-            val statusTag = if (isActive) " 🟢 (النشط حالياً)" else ""
+            val elapsed = System.currentTimeMillis() - acc.addedAt
+            val isExpired = acc.token.isBlank() || elapsed >= SESSION_DURATION_MS
+            val statusTag = when {
+                isActive && isExpired -> " 🔴 (النشط - منتهية الجلسة)"
+                isActive -> " 🟢 (النشط حالياً)"
+                isExpired -> " ⚪ (منتهية)"
+                else -> ""
+            }
             sb.append("${index + 1}. `$display`$statusTag\n")
         }
 
@@ -1038,10 +1099,22 @@ class LocalTelegramBotEngine private constructor(
         if (acc != null) {
             session.activePhone = acc.phone
             session.activeToken = acc.token
+            val display = apiClient.formatDisplayPhone(acc.phone)
+
+            if (isSessionExpired(session)) {
+                promptReLogin(token, chatId, session)
+                return
+            }
+
+            session.state = TelegramUserState.LOGGED_IN
             saveOrUpdateSession(session)
 
-            val display = apiClient.formatDisplayPhone(acc.phone)
-            val msg = "✅ *تم التبديل بنجاح!*\nالرقم النشط الآن هو: `$display`.\nأي تفعيل أو استعلام سيتم تطبيقه على هذا الرقم."
+            val remaining = getSessionRemainingFormatted(session)
+            val msg = "✅ *تم التبديل بنجاح!*\n" +
+                    "───────────────────\n" +
+                    "📱 *الرقم النشط الآن:* `$display`\n" +
+                    "⏳ *صلاحية الجلسة:* باقي $remaining (تتجدد كل 4 ساعات)\n\n" +
+                    "أي تفعيل أو استعلام سيتم تطبيقه على هذا الرقم."
             sendMessage(token, chatId, msg, getMainMenuMarkup())
         }
     }
@@ -1142,10 +1215,20 @@ class LocalTelegramBotEngine private constructor(
     }
 
     private suspend fun promptReLogin(token: String, chatId: Long, session: TelegramUserSession) {
+        val activeAcc = getActiveAccount(session)
+        val displayPhone = if (activeAcc != null) apiClient.formatDisplayPhone(activeAcc.phone) else ""
         session.state = TelegramUserState.IDLE
         session.activeToken = ""
+        if (activeAcc != null) {
+            activeAcc.token = ""
+        }
         saveOrUpdateSession(session)
-        sendMessage(token, chatId, "⌛ *انتهت صلاحية جلسة جيزي.*\n📱 يرجى إرسال رقم هاتفك لتسجيل الدخول برمز OTP جديد.", null)
+
+        val msg = "⌛ *انتهت صلاحية جلسة جيزي (بعد مرور 4 ساعات)*\n" +
+                (if (displayPhone.isNotBlank()) "📱 *الرقم:* `$displayPhone`\n\n" else "\n") +
+                "🔒 تنتهي الجلسة تلقائياً كل 4 ساعات وفق نظام جيزي لحماية أمان خطك.\n" +
+                "📱 يرجى كتابة رقم هاتفك لتسجيل الدخول مجدداً واستلام رمز OTP جديد."
+        sendMessage(token, chatId, msg, null)
     }
 
     private suspend fun sendWelcomeMessage(token: String, chatId: Long, firstName: String) {

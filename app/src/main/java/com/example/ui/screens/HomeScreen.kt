@@ -342,13 +342,13 @@ fun HomeScreen(
                         ) {
                             Column(horizontalAlignment = Alignment.End) {
                                 Text(
-                                    text = "الولوج المجاني بدون رصيد",
+                                    text = "الولوج المجاني عبر شبكة جيزي (0 دج)",
                                     style = MaterialTheme.typography.bodyMedium,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onSurface
                                 )
                                 Text(
-                                    text = "فقط شغّل بيانات الهاتف (4G) لشريحة جيزي حتى لو كان رصيدك 0 دج و 0 ميغا",
+                                    text = "شغّل بيانات الهاتف (2G / 3G / 4G) لشريحة جيزي - يتصل بالسيرفر مباشرة بـ 0 دج وبدون باقة",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     textAlign = TextAlign.Right
@@ -618,6 +618,18 @@ private fun ActiveAccountCard(
     onLogout: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val sessionLimitMs = 4 * 60 * 60 * 1000L
+    val elapsed = System.currentTimeMillis() - account.addedDate
+    val isSessionExpired = account.token == "EXPIRED" || account.token.isBlank() || elapsed >= sessionLimitMs
+    val remainingMs = maxOf(0L, sessionLimitMs - elapsed)
+    val remainingHours = remainingMs / (1000 * 60 * 60)
+    val remainingMins = (remainingMs % (1000 * 60 * 60)) / (1000 * 60)
+    val sessionStatusText = if (isSessionExpired) {
+        "انتهت الجلسة (4 ساعات) - يلزم تسجيل الدخول"
+    } else {
+        "جلسة نشطة: متبقي ${remainingHours}س و ${remainingMins}د"
+    }
+
     Card(
         modifier = modifier
             .fillMaxWidth()
@@ -655,13 +667,14 @@ private fun ActiveAccountCard(
                                 modifier = Modifier
                                     .size(8.dp)
                                     .clip(CircleShape)
-                                    .background(if (account.token == "EXPIRED") DjezzyRed else DjezzyGreen)
+                                    .background(if (isSessionExpired) DjezzyRed else DjezzyGreen)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = if (account.token == "EXPIRED") "بحاجة لتجديد الرمز" else "حساب جيزي نشط",
+                                text = sessionStatusText,
                                 style = MaterialTheme.typography.labelSmall,
-                                color = if (account.token == "EXPIRED") DjezzyRed else DjezzyGreen
+                                color = if (isSessionExpired) DjezzyRed else DjezzyGreen,
+                                fontSize = 10.sp
                             )
                         }
                     }

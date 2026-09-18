@@ -21,7 +21,7 @@ enum class TelegramUserState {
 data class SavedTelegramPhoneAccount(
     val phone: String,
     var token: String,
-    val addedAt: Long = System.currentTimeMillis(),
+    var addedAt: Long = System.currentTimeMillis(),
     var mgmInvitesSent: Int = 0,
     var last1GbActivatedAt: Long = 0L,
     var last2GbActivatedAt: Long = 0L,

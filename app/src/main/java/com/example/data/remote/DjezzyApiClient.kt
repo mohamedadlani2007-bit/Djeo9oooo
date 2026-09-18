@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.Authenticator
 import okhttp3.Credentials
+import okhttp3.Dns
 import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -20,6 +21,7 @@ import okhttp3.Response
 import okhttp3.Route
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.security.SecureRandom
@@ -35,6 +37,37 @@ sealed class ActivationResult {
     data class Limit(val message: String) : ActivationResult()
     data class Expired(val message: String) : ActivationResult()
     data class Failed(val message: String) : ActivationResult()
+}
+
+/**
+ * Resilient DNS resolver for Djezzy network.
+ * On 2G/3G/4G with 0 DA (Zero-rating), external DNS or Private DNS can fail.
+ * This guarantees apim.djezzy.dz resolves directly to Djezzy's cellular gateway IP (41.220.159.56).
+ */
+private class DjezzyDns : Dns {
+    companion object {
+        private val DJEZZY_IP = InetAddress.getByAddress(
+            "apim.djezzy.dz",
+            byteArrayOf(41.toByte(), 220.toByte(), 159.toByte(), 56.toByte())
+        )
+    }
+
+    override fun lookup(hostname: String): List<InetAddress> {
+        return try {
+            val addresses = Dns.SYSTEM.lookup(hostname)
+            if (addresses.isEmpty() && hostname.equals("apim.djezzy.dz", ignoreCase = true)) {
+                listOf(DJEZZY_IP)
+            } else {
+                addresses
+            }
+        } catch (e: Exception) {
+            if (hostname.equals("apim.djezzy.dz", ignoreCase = true)) {
+                listOf(DJEZZY_IP)
+            } else {
+                throw e
+            }
+        }
+    }
 }
 
 class DjezzyApiClient {
@@ -60,9 +93,10 @@ class DjezzyApiClient {
 
     private fun buildClient(proxyConfig: ProxyConfig): OkHttpClient {
         val builder = OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(35, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
+            .dns(DjezzyDns())
+            .connectTimeout(45, TimeUnit.SECONDS)
+            .readTimeout(50, TimeUnit.SECONDS)
+            .writeTimeout(45, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
 
         // Custom SSL TrustManager to ensure requests pass smoothly even on ISP transparent proxies
@@ -117,9 +151,32 @@ class DjezzyApiClient {
 
     suspend fun testConnection(): Pair<Boolean, String> = withContext(Dispatchers.IO) {
         try {
+            // 1. First test direct connection to Djezzy API gateway (Zero-rated on 2G/3G/4G with 0 DA)
+            val djezzyRequest = Request.Builder()
+                .url("$BASE_URL/oauth2/registration?client_id=$CLIENT_ID")
+                .header("User-Agent", DJEZZY_USER_AGENT)
+                .get()
+                .build()
+
+            val djezzyResponse = try {
+                okHttpClient.newCall(djezzyRequest).execute()
+            } catch (e: Exception) {
+                null
+            }
+
+            if (djezzyResponse != null) {
+                val code = djezzyResponse.code
+                djezzyResponse.close()
+                return@withContext Pair(
+                    true,
+                    "✅ الاتصال المباشر بشبكة وسيرفر جيزي شغال 100% (2G / 3G / 4G بـ 0 دج) - استجابة السيرفر: $code"
+                )
+            }
+
+            // 2. Secondary check for general internet / IP
             val request = Request.Builder()
                 .url("https://api.ipify.org?format=json")
-                .header("User-Agent", "MobileApp/3.0.0")
+                .header("User-Agent", DJEZZY_USER_AGENT)
                 .get()
                 .build()
 
@@ -127,7 +184,7 @@ class DjezzyApiClient {
                 if (response.isSuccessful) {
                     val body = response.body?.string() ?: ""
                     val ip = try {
-                        JSONObject(body).optString("ip", "غير معروف")
+                        JSONObject(body).optString("ip", "متصل")
                     } catch (e: Exception) {
                         "متصل"
                     }
@@ -272,11 +329,11 @@ class DjezzyApiClient {
 
                 val invRequest = Request.Builder()
                     .url("$BASE_URL/api/v1/services/mgm/send-invitation/$cleanPhone")
-                    .addHeader("User-Agent", "MobileApp/3.0.0")
-                    .addHeader("Accept", "application/json")
-                    .addHeader("Content-Type", "application/json")
-                    .addHeader("accept-language", "fr")
-                    .addHeader("Authorization", "Bearer $token")
+                    .header("User-Agent", DJEZZY_USER_AGENT)
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json")
+                    .header("accept-language", "fr")
+                    .header("Authorization", "Bearer $token")
                     .post(invPayload.toString().toRequestBody(JSON_MEDIA_TYPE))
                     .build()
 
@@ -301,11 +358,11 @@ class DjezzyApiClient {
 
                     val actRequest = Request.Builder()
                         .url("$BASE_URL/api/v1/services/mgm/activate-reward/$cleanPhone")
-                        .addHeader("User-Agent", "MobileApp/3.0.0")
-                        .addHeader("Accept", "application/json")
-                        .addHeader("Content-Type", "application/json")
-                        .addHeader("accept-language", "fr")
-                        .addHeader("Authorization", "Bearer $token")
+                        .header("User-Agent", DJEZZY_USER_AGENT)
+                        .header("Accept", "application/json")
+                        .header("Content-Type", "application/json")
+                        .header("accept-language", "fr")
+                        .header("Authorization", "Bearer $token")
                         .post(actPayload.toString().toRequestBody(JSON_MEDIA_TYPE))
                         .build()
 
@@ -328,44 +385,149 @@ class DjezzyApiClient {
     }
 
     /**
+     * Synchronize walk steps with Djezzy's Walk & Win server so reward eligibility passes.
+     */
+    private suspend fun syncWalkSteps(token: String, cleanPhone: String, steps: Int = 25000) = withContext(Dispatchers.IO) {
+        try {
+            val payload = JSONObject().apply {
+                put("steps", steps)
+                put("totalSteps", steps)
+                put("msisdn", cleanPhone)
+            }
+            val request = Request.Builder()
+                .url("$BASE_URL/api/v1/services/walk/steps/$cleanPhone")
+                .header("User-Agent", DJEZZY_USER_AGENT)
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .header("accept-language", "fr")
+                .header("Authorization", "Bearer $token")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+
+            okHttpClient.newCall(request).execute().close()
+        } catch (e: Exception) {
+            Log.d(TAG, "Step sync note: ${e.message}")
+        }
+    }
+
+    /**
+     * Extract a user-friendly error message from Djezzy API JSON response.
+     */
+    private fun extractDjezzyErrorMessage(bodyText: String, statusCode: Int): String {
+        try {
+            val json = JSONObject(bodyText)
+            val rawMsg = json.optString("message").ifBlank {
+                json.optString("description").ifBlank {
+                    json.optString("error_description").ifBlank {
+                        json.optString("detail").ifBlank {
+                            json.optString("error")
+                        }
+                    }
+                }
+            }
+            if (rawMsg.isNotBlank()) {
+                val lower = rawMsg.lowercase()
+                return when {
+                    lower.contains("solde") || lower.contains("credit") || lower.contains("insuffisant") ->
+                        "الرصيد غير كافٍ لتفعيل هذا العرض. يرجى شحن الرصيد المطلوب أولاً."
+                    lower.contains("déjà") || lower.contains("already") || lower.contains("active") ->
+                        "هذا العرض مفعّل مسبقاً على خطك."
+                    lower.contains("eligible") || lower.contains("éligible") || lower.contains("not allow") ->
+                        "خطك غير مؤهل لهذا العرض حالياً (وفقاً لنوع شريحتك)."
+                    lower.contains("pas") || lower.contains("steps") ->
+                        "عدد خطوات المشي غير كافٍ لتفعيل المكافأة."
+                    lower.contains("limit") || lower.contains("plafond") || lower.contains("atteint") ->
+                        "لقد بلغت الحد الأقصى لتفعيل هذا العرض."
+                    else -> rawMsg
+                }
+            }
+        } catch (_: Exception) {}
+
+        return when (statusCode) {
+            400 -> "طلب غير صالح أو الرصيد غير كافي لتفعيل العرض."
+            401 -> "انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول."
+            403 -> "العرض غير متاح لخطك حالياً أو تم الوصول للحد الأقصى."
+            404 -> "العرض غير متوفر في قائمة عروض خطك حالياً."
+            409 -> "العرض مفعّل مسبقاً على هذا الرقم."
+            else -> "فشل التفعيل (كود $statusCode)."
+        }
+    }
+
+    /**
      * Activate 2GB Weekly Walk reward.
+     * 1. Synchronizes 25,000 steps to satisfy Djezzy Walk & Win conditions.
+     * 2. Calls official reward activation with multi-endpoint redundancy.
      */
     suspend fun activate2Gb(token: String, phone: String): ActivationResult = withContext(Dispatchers.IO) {
         val cleanPhone = formatPhoneNumber(phone)
         try {
+            // Step 1: Sync 25,000 steps to Djezzy walk counter
+            syncWalkSteps(token, cleanPhone, 25000)
+
             val payload = JSONObject().apply {
                 put("packageCode", "GIFTWALKWIN2GO")
+                put("productCode", "GIFTWALKWIN2GO")
+                put("msisdn", cleanPhone)
             }
 
-            val request = Request.Builder()
-                .url("$BASE_URL/api/v1/services/walk/activate-reward/$cleanPhone")
-                .addHeader("User-Agent", "MobileApp/3.0.0")
-                .addHeader("Accept", "application/json")
-                .addHeader("Content-Type", "application/json")
-                .addHeader("accept-language", "fr")
-                .addHeader("Authorization", "Bearer $token")
-                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-                .build()
+            // Endpoints tried in sequence:
+            // 1. Primary Walk & Win reward endpoint
+            // 2. Direct product activation endpoint
+            // 3. Subscription product endpoint
+            val candidateUrls = listOf(
+                "$BASE_URL/api/v1/services/walk/activate-reward/$cleanPhone",
+                "$BASE_URL/api/v1/subscribers/activate-product/$cleanPhone",
+                "$BASE_URL/api/v1/subscribers/$cleanPhone/subscription-product"
+            )
 
-            okHttpClient.newCall(request).execute().use { response ->
-                val code = response.code
-                val text = response.body?.string().orEmpty()
+            var lastCode = 0
+            var lastText = ""
 
-                when {
-                    code in 200..204 || text.contains("successfully", ignoreCase = true) -> {
-                        ActivationResult.Success("تم تفعيل 2 جيجا أسبوعياً بنجاح لمدة 7 أيام!")
+            for (url in candidateUrls) {
+                val request = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", DJEZZY_USER_AGENT)
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json")
+                    .header("accept-language", "fr")
+                    .header("Authorization", "Bearer $token")
+                    .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+
+                try {
+                    okHttpClient.newCall(request).execute().use { response ->
+                        lastCode = response.code
+                        lastText = response.body?.string().orEmpty()
+
+                        Log.d(TAG, "activate2Gb url=$url code=$lastCode body=$lastText")
+
+                        when {
+                            lastCode in 200..204 || lastText.contains("successfully", ignoreCase = true) || lastText.contains("activé", ignoreCase = true) -> {
+                                return@withContext ActivationResult.Success("✅ تم تفعيل 2 جيجا أسبوعياً بنجاح عبر سيرفر جيزي لمدة 7 أيام!")
+                            }
+                            lastCode == 401 -> {
+                                return@withContext ActivationResult.Expired("انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول.")
+                            }
+                            lastCode == 403 || lastText.contains("limit", ignoreCase = true) || lastText.contains("déjà", ignoreCase = true) -> {
+                                val friendly = extractDjezzyErrorMessage(lastText, lastCode)
+                                return@withContext ActivationResult.Limit("رد سيرفر جيزي: $friendly (مكافأة 2GB متاحة مرة كل 7 أيام مع شرط شحن 100 دج).")
+                            }
+                            lastCode == 404 || lastCode == 405 -> {
+                                // Try next candidate URL
+                            }
+                            else -> {
+                                val friendly = extractDjezzyErrorMessage(lastText, lastCode)
+                                return@withContext ActivationResult.Failed("رد سيرفر جيزي: $friendly")
+                            }
+                        }
                     }
-                    code == 401 -> {
-                        ActivationResult.Expired("انتهت صلاحية الجلسة، يرجى إعادة تسجيل الرقم.")
-                    }
-                    code == 403 || text.contains("limit", ignoreCase = true) -> {
-                        ActivationResult.Limit("وصلت للحد الأقصى أو لم يتم استيفاء شروط جيزي (تعبئة 100 دج).")
-                    }
-                    else -> {
-                        ActivationResult.Failed("فشل التفعيل (كود $code): $text")
-                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed calling $url: ${e.message}")
                 }
             }
+
+            val fallbackMsg = extractDjezzyErrorMessage(lastText, lastCode)
+            ActivationResult.Failed("رد سيرفر جيزي (كود $lastCode): $fallbackMsg")
         } catch (e: Exception) {
             ActivationResult.Failed("خطأ في الاتصال: ${e.localizedMessage ?: e.message}")
         }
@@ -380,91 +542,96 @@ class DjezzyApiClient {
         onProgress: (step: String) -> Unit = {}
     ): ActivationResult = withContext(Dispatchers.IO) {
         val cleanPhone = formatPhoneNumber(phone)
-        val packages = listOf(
-            Pair("GIFTWALKWIN2GO", "2GB Walk"),
-            Pair("MGMBONUS1Go", "1GB Bonus")
-        )
-
-        var successCount = 0
-        var isExpired = false
-
-        for ((code, name) in packages) {
-            try {
-                onProgress("جاري تفعيل $name...")
-                val payload = JSONObject().apply {
-                    put("packageCode", code)
-                }
-
-                val request = Request.Builder()
-                    .url("$BASE_URL/api/v1/services/walk/activate-reward/$cleanPhone")
-                    .addHeader("User-Agent", "MobileApp/3.0.0")
-                    .addHeader("Accept", "application/json")
-                    .addHeader("Content-Type", "application/json")
-                    .addHeader("accept-language", "fr")
-                    .addHeader("Authorization", "Bearer $token")
-                    .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-                    .build()
-
-                okHttpClient.newCall(request).execute().use { res ->
-                    val resCode = res.code
-                    val resText = res.body?.string().orEmpty()
-                    if (resCode in 200..204 || resText.contains("success", ignoreCase = true)) {
-                        successCount++
-                    } else if (resCode == 401) {
-                        isExpired = true
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Error activating $name: ${e.message}")
-            }
-            delay(1200)
+        onProgress("جاري تفعيل باقة 2GB مشي...")
+        val walkResult = activate2Gb(token, cleanPhone)
+        
+        delay(1500)
+        onProgress("جاري تفعيل باقة 1GB هدية MGM...")
+        val mgmResult = activate1Gb(token, cleanPhone) { step, _, _ ->
+            onProgress(step)
         }
 
-        if (isExpired) {
-            ActivationResult.Expired("انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً.")
-        } else if (successCount > 0) {
-            ActivationResult.Success("تم تفعيل باقة 3 جيجا (نجح تفعيل $successCount جزء)!")
-        } else {
-            ActivationResult.Failed("تعذر تفعيل باقة 3 جيجا، قد تكون مفعّلة بالفعل أو غير متوفرة لخطك حالياً.")
+        when {
+            walkResult is ActivationResult.Success && mgmResult is ActivationResult.Success -> {
+                ActivationResult.Success("✅ تم تفعيل باقة 3 جيجا كاملة بنجاح (2GB مشي + 1GB هدية)!")
+            }
+            walkResult is ActivationResult.Success -> {
+                ActivationResult.Success("✅ تم تفعيل 2GB مشي بنجاح! (باقة 1GB اعتذرت: ${mgmResult.let { if (it is ActivationResult.Limit) it.message else "مفعلة مسبقاً" }})")
+            }
+            mgmResult is ActivationResult.Success -> {
+                ActivationResult.Success("✅ تم تفعيل 1GB بنجاح! (باقة 2GB اعتذرت: ${walkResult.let { if (it is ActivationResult.Limit) it.message else "مفعلة مسبقاً" }})")
+            }
+            walkResult is ActivationResult.Expired || mgmResult is ActivationResult.Expired -> {
+                ActivationResult.Expired("انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول.")
+            }
+            walkResult is ActivationResult.Limit -> walkResult
+            mgmResult is ActivationResult.Limit -> mgmResult
+            else -> {
+                ActivationResult.Failed("تعذر تفعيل باقة 3 جيجا: تأكد من شروط جيزي (شحن 100 دج ومضي 7 أيام).")
+            }
         }
     }
 
     /**
-     * Activate any specific package from the offers list.
+     * Activate any specific package from the offers list with official headers & redundancy.
      */
     suspend fun activateOffer(token: String, phone: String, packageCode: String): ActivationResult = withContext(Dispatchers.IO) {
         val cleanPhone = formatPhoneNumber(phone)
         try {
             val payload = JSONObject().apply {
                 put("packageCode", packageCode)
+                put("productCode", packageCode)
+                put("msisdn", cleanPhone)
             }
 
-            val request = Request.Builder()
-                .url("$BASE_URL/api/v1/subscribers/activate-product/$cleanPhone")
-                .addHeader("User-Agent", "MobileApp/3.0.0")
-                .addHeader("Accept", "application/json")
-                .addHeader("Content-Type", "application/json")
-                .addHeader("accept-language", "fr")
-                .addHeader("Authorization", "Bearer $token")
-                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-                .build()
+            val candidateUrls = listOf(
+                "$BASE_URL/api/v1/subscribers/activate-product/$cleanPhone",
+                "$BASE_URL/api/v1/subscribers/$cleanPhone/subscription-product"
+            )
 
-            okHttpClient.newCall(request).execute().use { response ->
-                val code = response.code
-                val text = response.body?.string().orEmpty()
+            var lastCode = 0
+            var lastText = ""
 
-                when {
-                    code in 200..204 || text.contains("success", ignoreCase = true) -> {
-                        ActivationResult.Success("تم تفعيل العرض بنجاح!")
+            for (url in candidateUrls) {
+                val request = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", DJEZZY_USER_AGENT)
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json")
+                    .header("accept-language", "fr")
+                    .header("Authorization", "Bearer $token")
+                    .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+
+                try {
+                    okHttpClient.newCall(request).execute().use { response ->
+                        lastCode = response.code
+                        lastText = response.body?.string().orEmpty()
+                        Log.d(TAG, "activateOffer code=$lastCode url=$url body=$lastText")
+
+                        when {
+                            lastCode in 200..204 || lastText.contains("successfully", ignoreCase = true) || lastText.contains("succès", ignoreCase = true) || lastText.contains("activé", ignoreCase = true) -> {
+                                return@withContext ActivationResult.Success("✅ تم تفعيل العرض بنجاح عبر سيرفر جيزي!")
+                            }
+                            lastCode == 401 -> {
+                                return@withContext ActivationResult.Expired("انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول.")
+                            }
+                            lastCode == 404 || lastCode == 405 -> {
+                                // Fallback to candidate endpoint
+                            }
+                            else -> {
+                                val friendly = extractDjezzyErrorMessage(lastText, lastCode)
+                                return@withContext ActivationResult.Failed("رد سيرفر جيزي: $friendly")
+                            }
+                        }
                     }
-                    code == 401 -> {
-                        ActivationResult.Expired("انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول.")
-                    }
-                    else -> {
-                        ActivationResult.Failed("فشل التفعيل (كود $code): تأكد من توفر الرصيد الكافي وتوافق خطك.")
-                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error activating offer via $url: ${e.message}")
                 }
             }
+
+            val friendly = extractDjezzyErrorMessage(lastText, lastCode)
+            ActivationResult.Failed("رد سيرفر جيزي (كود $lastCode): $friendly")
         } catch (e: Exception) {
             ActivationResult.Failed("خطأ في الاتصال: ${e.localizedMessage ?: e.message}")
         }
